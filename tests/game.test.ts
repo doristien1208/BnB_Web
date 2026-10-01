@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { RULES, TILE } from '../shared/constants';
+import { RULES, TILE, TICK_RATE } from '../shared/constants';
+import { SUPPLY_ITEMS } from '../shared/items';
 import { MAPS, type MapDef } from '../shared/maps';
 import type { GamePlayerInfo, Mode } from '../shared/protocol';
-import { ALIVE, DEAD, Game, TRAPPED, tileCenter, tileIndex, type Player } from '../shared/sim/game';
+import { ALIVE, DEAD, Game, TRAPPED, ringOf, tileCenter, tileIndex, type Player } from '../shared/sim/game';
 import type { Dir } from '../shared/types';
 
 const OPEN = [
@@ -206,6 +207,201 @@ describe('mounts', () => {
     run(g, RULES.fuse + RULES.streamLinger + 2);
     expect(b.mount).toBeNull();
     expect(b.state).toBe(ALIVE);
+  });
+
+  /** a sets off two balloons in one chain reaction, both streams crossing (6,5) where b rides */
+  function chainOnRider() {
+    const g = makeGame();
+    const [a, b] = [P(g, 'a'), P(g, 'b')];
+    a.bal = 2;
+    a.pow = 2;
+    put(a, 5, 5);
+    g.pushAction('a', 'b');
+    g.step();
+    put(a, 7, 5);
+    g.pushAction('a', 'b');
+    g.step();
+    put(a, 0, 12);
+    b.mount = 'owl';
+    put(b, 6, 5);
+    run(g, RULES.fuse - 1);
+    expect(g.blasts).toHaveLength(2);
+    return g;
+  }
+
+  it('leave the rider untouchable for a second, so a chain reaction counts as one hit', () => {
+    const g = chainOnRider();
+    const b = P(g, 'b');
+    expect(b.mount).toBeNull();
+    expect(b.state).toBe(ALIVE);
+    expect(b.invulnT).toBeGreaterThan(RULES.mountInvuln - 5);
+    run(g, RULES.streamLinger + 2);
+    expect(b.state).toBe(ALIVE);
+  });
+
+  it('protect for one second only', () => {
+    const g = chainOnRider();
+    const [a, b] = [P(g, 'a'), P(g, 'b')];
+    run(g, RULES.mountInvuln);
+    expect(b.invulnT).toBe(0);
+    put(a, 6, 6);
+    g.pushAction('a', 'b');
+    g.step();
+    put(a, 0, 12);
+    run(g, RULES.fuse);
+    expect(b.state).toBe(TRAPPED);
+  });
+});
+
+describe('shrink', () => {
+  /** jumps the clock to `left` ticks before ring `ring` closes (rings before it already closed) */
+  function nearShrink(g: Game, left: number) {
+    g.timeLeft = RULES.shrinkStart - g.shrunk * RULES.shrinkEvery + left + 1;
+  }
+
+  it('warns, then closes the outer ring and crushes whoever is still on it', () => {
+    const g = makeGame({ n: 3 });
+    const [a, b, c] = [P(g, 'a'), P(g, 'b'), P(g, 'c')];
+    put(a, 0, 5); // on ring 0
+    put(b, 3, 3); // safe inside
+    put(c, 1, 6); // inner edge, overlapping ring 0
+    c.x -= 6;
+    g.items[tileIndex(14, 6)] = 'potion';
+    nearShrink(g, RULES.shrinkWarn);
+    g.step();
+    expect(g.snapshot().fx.some((f) => f.k === 'warn')).toBe(true);
+    expect(g.shrinkIn()).toBe(RULES.shrinkWarn);
+    run(g, RULES.shrinkWarn - 60);
+    put(b, 0, 9);
+    g.pushAction('b', 'b'); // a balloon on the ring, a second before it closes
+    g.step();
+    put(b, 3, 3);
+    expect(g.balloons).toHaveLength(1);
+    run(g, 59);
+    expect(g.shrunk).toBe(1);
+    expect(a.state).toBe(DEAD);
+    expect(b.state).toBe(ALIVE);
+    expect(c.state).toBe(ALIVE);
+    expect(c.x).toBeGreaterThanOrEqual(TILE + RULES.hitbox / 2); // pushed off the closed tiles
+    for (let i = 0; i < g.grid.length; i++) expect(g.grid[i] === '%').toBe(ringOf(i) === 0);
+    expect(g.items[tileIndex(14, 6)]).toBeNull();
+    expect(g.balloons).toHaveLength(0);
+  });
+
+  it('closes one ring every 10 seconds, four at most', () => {
+    const g = makeGame();
+    put(P(g, 'a'), 7, 6);
+    put(P(g, 'b'), 7, 5);
+    nearShrink(g, 0);
+    g.step();
+    for (let k = 1; k < RULES.shrinkRings; k++) {
+      run(g, RULES.shrinkEvery - 1);
+      expect(g.shrunk).toBe(k);
+      g.step();
+    }
+    expect(g.shrunk).toBe(RULES.shrinkRings);
+    expect(g.shrinkIn()).toBe(-1);
+    expect(g.grid[tileIndex(7, 6)]).toBe('.');
+    expect(g.grid.filter((t) => t === '%')).toHaveLength(15 * 13 - 7 * 5);
+  });
+
+  it('is off in rounds shorter than the schedule', () => {
+    const infos: GamePlayerInfo[] = ['a', 'b'].map((id, k) => ({ id, name: id, char: 0, color: k, team: -1, slot: k }));
+    const g = new Game(mapOf(), infos, { mode: 'ffa', time: 30, seed: 1 });
+    expect(g.shrinkIn()).toBe(-1);
+  });
+
+  it('a balloon in the air over a closing ring lands on free floor', () => {
+    const g = makeGame();
+    const a = P(g, 'a');
+    put(a, 5, 6);
+    a.face = 3;
+    a.glove = true;
+    g.pushAction('a', 'b');
+    g.step();
+    g.pushAction('a', 'b'); // thrown three tiles left, onto (2,6); then (1,6)... ring 0 is (0,6)
+    g.step();
+    put(a, 7, 3);
+    put(P(g, 'b'), 7, 7); // nobody on the ring, so the round goes on
+    const b = g.balloons[0]!;
+    b.fly!.tx = tileCenter(0); // aim it at the ring
+    nearShrink(g, 0);
+    run(g, RULES.throwTime + 2);
+    expect(b.fly).toBeNull();
+    expect(g.grid[tileIndex(Math.floor(b.x / TILE), Math.floor(b.y / TILE))]).toBe('.');
+  });
+});
+
+describe('supply drops', () => {
+  it('drop two basic items every 30 seconds onto free floor', () => {
+    const g = makeGame();
+    put(P(g, 'a'), 0, 0);
+    put(P(g, 'b'), 14, 12);
+    run(g, RULES.supplyEvery);
+    expect(g.drops).toHaveLength(RULES.supplyCount);
+    expect(g.snapshot().dr).toHaveLength(RULES.supplyCount);
+    for (const d of g.drops) expect(SUPPLY_ITEMS).toContain(d.item);
+    const tiles = g.drops.map((d) => d.tile);
+    expect(new Set(tiles).size).toBe(tiles.length);
+    run(g, RULES.supplyFall);
+    expect(g.drops).toHaveLength(0);
+    for (const i of tiles) expect(SUPPLY_ITEMS).toContain(g.items[i]);
+    run(g, RULES.supplyEvery - RULES.supplyFall);
+    expect(g.drops).toHaveLength(RULES.supplyCount); // the next ones are on their way
+    expect(g.items.filter(Boolean)).toHaveLength(RULES.supplyCount);
+  });
+});
+
+describe('balloon machine', () => {
+  const machineRows = withTiles(
+    [6, 7, 8].flatMap((c) => [5, 6, 7].map((r) => [c, r, 'M'] as [number, number, string])),
+  );
+
+  it('fires 4 to 8 balloons with 2-tile streams every 20 seconds', () => {
+    for (let seed = 1; seed <= 6; seed++) {
+      const infos: GamePlayerInfo[] = ['a', 'b'].map((id, k) => ({ id, name: id, char: 0, color: k, team: -1, slot: k }));
+      const g = new Game(mapOf(machineRows), infos, { mode: 'ffa', time: 180, seed });
+      g.countdown = 1;
+      g.step();
+      expect(g.machine).toEqual({ c: 7, r: 6 });
+      run(g, RULES.machineEvery - 1);
+      expect(g.balloons).toHaveLength(0);
+      g.step();
+      const n = g.balloons.length;
+      expect(n).toBeGreaterThanOrEqual(RULES.machineMin);
+      expect(n).toBeLessThanOrEqual(RULES.machineMax);
+      for (const b of g.balloons) {
+        expect(b.owner).toBe('');
+        expect(b.pow).toBe(RULES.machinePow);
+        expect(b.fly).not.toBeNull();
+      }
+      run(g, TICK_RATE * 2);
+      for (const b of g.balloons) {
+        expect(b.fly).toBeNull();
+        expect(g.grid[tileIndex(Math.floor(b.x / TILE), Math.floor(b.y / TILE))]).toBe('.');
+      }
+      expect(g.machineT).toBe(RULES.machineEvery - TICK_RATE * 2);
+    }
+  });
+
+  it('blocks streams and players like a wall', () => {
+    const infos: GamePlayerInfo[] = ['a', 'b'].map((id, k) => ({ id, name: id, char: 0, color: k, team: -1, slot: k }));
+    const g = new Game(mapOf(machineRows), infos, { mode: 'ffa', time: 180, seed: 3 });
+    g.countdown = 1;
+    g.step();
+    const a = P(g, 'a');
+    put(a, 5, 6);
+    a.pow = 3;
+    g.pushAction('a', 'b');
+    g.step();
+    put(a, 5, 0);
+    run(g, RULES.fuse);
+    expect(g.blasts[0]!.arms[3]).toBe(0); // right arm stops at the machine
+    run(g, RULES.streamLinger + 1);
+    put(a, 5, 6);
+    g.setInput('a', 4, 0);
+    run(g, 30);
+    expect(a.x).toBeLessThanOrEqual(tileCenter(5) + (TILE - RULES.hitbox) / 2 + 0.01);
   });
 });
 
@@ -444,7 +640,7 @@ describe('end of round', () => {
 });
 
 describe('every map', () => {
-  it.each(MAPS.map((m) => [m.name, m] as const))('%s survives a minute of random play', (_n, map) => {
+  it.each(MAPS.map((m) => [m.name, m] as const))('%s survives two minutes of random play', (_n, map) => {
     const infos: GamePlayerInfo[] = [0, 1, 2, 3].map((k) => ({
       id: `p${k}`,
       name: `P${k}`,
@@ -453,10 +649,10 @@ describe('every map', () => {
       team: k % 2,
       slot: k,
     }));
-    const g = new Game(map, infos, { mode: 'team', time: 60, seed: map.id + 1 });
+    const g = new Game(map, infos, { mode: 'team', time: 120, seed: map.id + 1 });
     let seed = 1;
     const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
-    for (let t = 0; t < 60 * 70 && g.phase !== 'over'; t++) {
+    for (let t = 0; t < 60 * 130 && g.phase !== 'over'; t++) {
       for (const p of infos) {
         if (rand() < 0.05) g.setInput(p.id, Math.floor(rand() * 5) as Dir, Math.floor(rand() * 5) as Dir);
         if (rand() < 0.02) g.pushAction(p.id, rand() < 0.8 ? 'b' : 'u');

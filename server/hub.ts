@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { WebSocket } from 'ws';
+import { VERSION } from '../shared/constants';
 import type { C2S, RoomSummary, S2C } from '../shared/protocol';
 import { log } from './log';
 import { Room } from './room';
@@ -111,6 +112,7 @@ export class Hub {
   health() {
     return {
       ok: true,
+      version: VERSION,
       rooms: this.rooms.size,
       playing: [...this.rooms.values()].filter((r) => r.phase !== 'waiting').length,
       online: this.onlineCount(),

@@ -5,7 +5,9 @@ import type { ItemType } from './items';
  *   .  floor          #  hard wall (indestructible)   x  crate (destructible, may drop an item)
  *   *  bush (hides)   o  pushable barrel               ~  water channel (players cannot enter)
  *   =  ice (slide)    < > ^ v  conveyor belt           @  portal (links to the point-symmetric portal)
+ *   M  balloon machine (3x3 block in 水球工廠, fires balloons)
  *   1-4  spawn points (floor)
+ * At run time the shrink turns closed rings into `%` (solid, like `#`).
  * Every map is mirror-symmetric on both axes; tests/maps.test.ts enforces this and spawn safety.
  */
 export type ThemeKey =
@@ -18,7 +20,8 @@ export type ThemeKey =
   | 'candy'
   | 'graveyard'
   | 'arena'
-  | 'maze';
+  | 'maze'
+  | 'balloonworks';
 
 export interface MapDef {
   id: number;
@@ -266,6 +269,29 @@ export const MAPS: readonly MapDef[] = [
       'x..#...#...#..x',
       '.###.#.#.#.###.',
       '3..x.#...#.x..4',
+    ],
+  },
+  {
+    id: 10,
+    key: 'balloonworks',
+    name: '水球工廠',
+    tag: '中央水球機',
+    stars: 3,
+    desc: '中央的水球機每 20 秒朝四周吐出 4–8 顆水球（水柱 2 格）',
+    grid: [
+      '1.xxxx.x.xxxx.2',
+      '.#x#xx#x#xx#x#.',
+      'xxx.x.xxx.x.xxx',
+      'x#x#x#...#x#x#x',
+      'xx.xx.....xx.xx',
+      '.x#x..MMM..x#x.',
+      'xx.x..MMM..x.xx',
+      '.x#x..MMM..x#x.',
+      'xx.xx.....xx.xx',
+      'x#x#x#...#x#x#x',
+      'xxx.x.xxx.x.xxx',
+      '.#x#xx#x#xx#x#.',
+      '3.xxxx.x.xxxx.4',
     ],
   },
 ];

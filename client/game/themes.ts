@@ -2,8 +2,19 @@ import type { ThemeKey } from '../../shared/maps';
 import { INK, WHITE, cached, sprite, type Px } from './art';
 
 type FloorStyle = 'grass' | 'plank' | 'snow' | 'plate' | 'sand' | 'candy' | 'dirt' | 'stone';
-type HardStyle = 'house' | 'tree' | 'mast' | 'rock' | 'machine' | 'sandstone' | 'candy' | 'tomb' | 'pillar' | 'brick';
-type SoftStyle = 'crate' | 'snow' | 'gift' | 'pot';
+type HardStyle =
+  | 'house'
+  | 'tree'
+  | 'mast'
+  | 'rock'
+  | 'machine'
+  | 'sandstone'
+  | 'candy'
+  | 'tomb'
+  | 'pillar'
+  | 'brick'
+  | 'tank';
+type SoftStyle = 'crate' | 'snow' | 'gift' | 'pot' | 'box';
 
 export interface Theme {
   floor: FloorStyle;
@@ -100,6 +111,13 @@ export const THEMES: Record<ThemeKey, Theme> = {
     soft: 'crate', ...WOOD,
     bush: '#4f8a43', bushDark: '#2e5a27', bushLight: '#86bf6c',
     panel: '#56493a', music: 1,
+  },
+  balloonworks: {
+    floor: 'plate', floorA: '#a9bfcf', floorB: '#9fb6c7', floorMark: '#7b95a8',
+    hard: 'tank', hardMain: '#4f8fc0', hardDark: '#2c5a80', hardLight: '#9fd0f0', hardAccent: '#f2c230',
+    soft: 'box', softMain: '#e2bd84', softDark: '#9c7440', softLight: '#f4ddb2', softAccent: '#46a8f0',
+    bush: '#3f9e4d', bushDark: '#246b30', bushLight: '#7fd36f',
+    panel: '#2b4f6e', music: 2,
   },
 };
 
@@ -285,6 +303,19 @@ const HARD: Record<HardStyle, (p: Px, t: Theme) => void> = {
     ] as const)
       p.rect(x, y, 1, 3, t.hardDark);
   },
+  tank: (p, t) => {
+    p.rect(3, 4, 14, 19, INK);
+    p.rect(4, 5, 12, 17, t.hardMain);
+    p.rect(5, 5, 2, 17, t.hardLight);
+    p.rect(4, 10, 12, 1, t.hardDark);
+    p.rect(4, 17, 12, 1, t.hardDark);
+    p.ovalO(10, 4.5, 7, 2.6, t.hardLight, INK);
+    p.rect(8, 1, 4, 3, INK);
+    p.rect(9, 1, 2, 2, t.hardAccent);
+    p.ovalO(12.5, 13.5, 2.3, 2.3, WHITE, INK);
+    p.dot(13, 13, '#e53935');
+    p.rect(3, 22, 14, 1, INK);
+  },
 };
 
 export function softSprite(key: ThemeKey): HTMLCanvasElement {
@@ -335,6 +366,16 @@ const SOFT: Record<SoftStyle, (p: Px, t: Theme) => void> = {
     p.rect(6, 3, 8, 1, t.softLight);
     p.rect(3, 13, 14, 2, t.softAccent);
     p.oval(6.5, 12, 1.5, 2.5, t.softLight);
+  },
+  box: (p, t) => {
+    p.rect(1, 5, 18, 18, INK);
+    p.rect(2, 6, 16, 16, t.softMain);
+    p.rect(2, 6, 16, 3, t.softLight);
+    p.rect(9, 6, 2, 5, t.softDark);
+    p.ovalO(10, 15.5, 4.2, 3.8, t.softAccent, INK);
+    p.dot(9, 14, WHITE);
+    p.rect(10, 19, 1, 2, INK);
+    p.rect(2, 21, 16, 1, t.softDark);
   },
 };
 
@@ -436,6 +477,81 @@ export function portalSprite(frame: number): HTMLCanvasElement {
         const a = (k / 4) * Math.PI * 2 + (frame / 8) * Math.PI * 2;
         p.rect(10 + Math.cos(a) * 5.5 - 1, 10 + Math.sin(a) * 5.5 - 1, 2, 2, '#b39ddb');
       }
+    }),
+  );
+}
+
+// ---------------------------------------------------------------- shrink, balloon machine
+
+/** Block that drops onto a ring closed by the shrink (20 x 24, like the walls). */
+export function closedSprite(): HTMLCanvasElement {
+  return cached('closed', () =>
+    sprite(20, 24, (p) => {
+      p.rect(0, 3, 20, 21, INK);
+      p.rect(1, 4, 18, 11, '#7d8893');
+      p.rect(1, 4, 18, 3, '#aab5c0');
+      for (const [x, y] of [
+        [3, 8],
+        [16, 8],
+        [3, 12],
+        [16, 12],
+      ] as const)
+        p.dot(x, y, '#4a535c');
+      for (let y = 15; y < 23; y++) for (let x = 1; x < 19; x++) p.dot(x, y, (x + y) % 6 < 3 ? INK : '#f2c230');
+    }),
+  );
+}
+
+/** Red and yellow stripes laid over a ring that is about to close (20 x 20, transparent gaps). */
+export function hazardSprite(): HTMLCanvasElement {
+  return cached('hazard', () =>
+    sprite(20, 20, (p) => {
+      for (let y = 0; y < 20; y++) for (let x = 0; x < 20; x++) if ((x + y) % 10 < 5) p.dot(x, y, '#ff5252');
+    }),
+  );
+}
+
+/** The balloon machine of 水球工廠: 3 x 3 tiles plus 12 art px of height (60 x 72). */
+export function machineSprite(): HTMLCanvasElement {
+  return cached('machine', () =>
+    sprite(60, 72, (p) => {
+      p.rect(2, 62, 56, 9, INK);
+      p.rect(3, 63, 54, 7, '#33424f');
+      // body
+      p.rect(5, 31, 50, 33, INK);
+      p.rect(6, 32, 48, 31, '#5f7f99');
+      p.rect(6, 32, 48, 5, '#8fb3cc');
+      p.rect(6, 56, 48, 7, '#46637a');
+      for (const x of [9, 50]) for (const y of [35, 59]) p.dot(x, y, '#2f4252');
+      // gauge window (the charge bar is drawn over it while playing)
+      p.rect(12, 40, 36, 8, INK);
+      p.rect(13, 41, 34, 6, '#1c2630');
+      // chute
+      p.rect(23, 50, 14, 13, INK);
+      p.rect(24, 51, 12, 12, '#26323c');
+      p.rect(24, 51, 12, 2, '#3b4a57');
+      // glass dome full of balloons
+      p.ovalO(30, 21, 22, 17, '#d6f1ff', INK);
+      p.oval(30, 23, 20, 14, '#a9dcf4');
+      const colors = ['#e84a4a', '#46a8f0', '#f2d23a', '#4cbf5c', '#9b59d0', '#f07ab8', '#46a8f0', '#f39233'];
+      [
+        [18, 27],
+        [25, 30],
+        [33, 29],
+        [41, 27],
+        [22, 20],
+        [30, 22],
+        [38, 20],
+        [30, 14],
+      ].forEach(([x, y], k) => {
+        p.ovalO(x!, y!, 4, 3.8, colors[k]!, INK);
+        p.dot(x! - 1, y! - 1, WHITE);
+      });
+      p.oval(20, 11, 4, 2, WHITE);
+      p.rect(8, 33, 44, 2, INK);
+      // valve on top
+      p.rect(26, 1, 8, 5, INK);
+      p.rect(27, 2, 6, 3, '#f2c230');
     }),
   );
 }

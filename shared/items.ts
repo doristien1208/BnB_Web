@@ -58,6 +58,9 @@ export const ITEMS: Readonly<Record<ItemType, ItemDef>> = {
 
 export const ITEM_TYPES = Object.keys(ITEMS) as ItemType[];
 
+/** What supply drops carry: one of the three basic stat items each. */
+export const SUPPLY_ITEMS: readonly ItemType[] = ['bubble', 'potion', 'skate'];
+
 export const ITEM_BY_CODE: Readonly<Record<string, ItemType>> = Object.fromEntries(
   ITEM_TYPES.map((t) => [ITEMS[t].code, t]),
 );

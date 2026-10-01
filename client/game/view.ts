@@ -1,31 +1,37 @@
 import { CHARACTERS } from '../../shared/characters';
 import { COLORS, TEAMS } from '../../shared/colors';
-import { COLS, FIELD_H, FIELD_W, RULES, TICK_MS, TICK_RATE, TILE, VIEW_H, VIEW_W } from '../../shared/constants';
+import { COLS, FIELD_H, FIELD_W, RULES, TICK_RATE, TILE, VIEW_H, VIEW_W } from '../../shared/constants';
 import { ITEMS, ITEM_BY_CODE, MOUNT_BY_CODE } from '../../shared/items';
 import { MAPS } from '../../shared/maps';
-import type {
-  C2S,
-  Fx,
-  GamePlayerInfo,
-  GameResult,
-  GameStartInfo,
-  SnapBalloon,
-  SnapBlast,
-  SnapPlayer,
-  Snapshot,
+import {
+  BOT_LEVELS,
+  type C2S,
+  type Fx,
+  type GamePlayerInfo,
+  type GameResult,
+  type GameStartInfo,
+  type SnapBalloon,
+  type SnapBlast,
+  type SnapPlayer,
+  type Snapshot,
 } from '../../shared/protocol';
+import { ringOf } from '../../shared/sim/game';
 import type { Audio } from '../audio';
-import { h } from '../dom';
+import { h, isSubmitKey } from '../dom';
 import { balloonSprite, bananaSprite, characterSprite, itemSprite, mountSprite } from './art';
 import { Input } from './input';
+import { Playback } from './playback';
 import {
   THEMES,
   barrelSprite,
   bushSprite,
+  closedSprite,
   conveyorSprite,
   floorSprite,
   hardSprite,
+  hazardSprite,
   iceSprite,
+  machineSprite,
   portalSprite,
   softSprite,
   waterSprite,
@@ -33,9 +39,10 @@ import {
 } from './themes';
 
 export const FONT = '"PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif';
-const DELAY = 3; // ticks the world is drawn behind the newest snapshot (smooths network jitter)
-const SELF_DELAY = 1; // your own character uses fresher data so controls feel direct
+const WORLD_EXTRA = 1.5; // everything else is drawn this much further back: smoother, and nobody notices
+const MAX_EXTRAPOLATE = 2; // ticks motion carries on past the newest snapshot while the next one is late
 const BELT: Record<string, number> = { '^': 1, v: 2, '<': 3, '>': 4 };
+const MACHINE_BALLOON = 8; // balloon tag colour index with no player colour: the machine's balloons
 
 /** Anything that can carry client messages: the WebSocket client, or the offline sandbox. */
 export interface Link {
@@ -47,6 +54,9 @@ interface Sample {
   a: Snapshot;
   b: Snapshot | null;
   f: number;
+  /** when `b` is missing: the snapshot before `a`, and how many ticks past `a` to carry motion on */
+  prev: Snapshot | null;
+  ex: number;
 }
 
 interface Effect {
@@ -64,21 +74,6 @@ interface ChatLine {
   at: number;
 }
 
-/** Maps server ticks onto local time; follows the newest snapshot, drifts down slowly if packets bunch up. */
-class ServerClock {
-  private offset: number | null = null;
-
-  observe(tick: number): void {
-    const now = performance.now() / TICK_MS;
-    if (this.offset === null || tick > now + this.offset) this.offset = tick - now;
-    else this.offset += (tick - (now + this.offset)) * 0.01;
-  }
-
-  now(): number {
-    return performance.now() / TICK_MS + (this.offset ?? 0);
-  }
-}
-
 export class GameView {
   readonly root: HTMLElement;
   private readonly canvas: HTMLCanvasElement;
@@ -90,10 +85,14 @@ export class GameView {
   private readonly me: GamePlayerInfo | undefined;
   private readonly input: Input;
   private readonly chatBox: HTMLInputElement;
-  private readonly clock = new ServerClock();
+  private readonly clock = new Playback();
+  private readonly machine: { x: number; y: number } | null = null;
   private snaps: Snapshot[] = [];
+  private pending: { k: number; f: Fx }[] = [];
   private grid = '';
   private items = '';
+  private shownGrid = '';
+  private closedAt = new Map<number, number>();
   private raf = 0;
   private scale = 1;
   private effects: Effect[] = [];
@@ -101,7 +100,12 @@ export class GameView {
   private result: GameResult | null = null;
   private resultAt = 0;
   private goAt = 0;
+  private bannerAt = 0;
+  private banner = '';
+  private shakeAt = 0;
+  private spitAt = 0;
   private lastSecond = -1;
+  private lastWarnSecond = -1;
   private lastBoom = 0;
   private overlay: HTMLElement | null = null;
   private destroyed = false;
@@ -116,6 +120,11 @@ export class GameView {
     this.theme = THEMES[map.key];
     for (const p of info.players) this.players.set(p.id, p);
     this.me = this.players.get(meId);
+    const machine = map.grid.flatMap((row, r) => [...row].flatMap((t, c) => (t === 'M' ? [[c, r] as const] : [])));
+    if (machine.length) {
+      const avg = (k: 0 | 1) => machine.reduce((s, m) => s + m[k], 0) / machine.length;
+      this.machine = { x: avg(0) * TILE + TILE / 2, y: avg(1) * TILE + TILE / 2 };
+    }
 
     this.canvas = h('canvas', { class: 'game-canvas' });
     this.ctx = this.canvas.getContext('2d')!;
@@ -160,12 +169,16 @@ export class GameView {
   }
 
   onSnap(s: Snapshot): void {
+    // grid and items only come when they change; every snapshot keeps the layers that were current,
+    // so a crate disappears when its stream is drawn, not when the packet arrives
     if (s.g) this.grid = s.g;
+    else s.g = this.grid;
     if (s.i) this.items = s.i;
-    this.clock.observe(s.k);
+    else s.i = this.items;
+    this.clock.observe(s.k, performance.now());
     this.snaps.push(s);
     if (this.snaps.length > 90) this.snaps.splice(0, this.snaps.length - 90);
-    for (const f of s.fx) this.handleFx(f, s.k);
+    for (const f of s.fx) this.pending.push({ k: s.k, f });
     if (s.ph === 0) {
       const sec = Math.ceil(s.cd / TICK_RATE);
       if (sec !== this.lastSecond) {
@@ -194,12 +207,14 @@ export class GameView {
 
   private readonly onKey = (e: KeyboardEvent): void => {
     if (e.code === 'Enter') {
-      e.preventDefault();
       if (document.activeElement === this.chatBox) {
+        if (!isSubmitKey(e)) return; // Enter that confirms a Chinese IME composition
+        e.preventDefault();
         const text = this.chatBox.value.trim();
         if (text) this.net.send({ t: 'chat', text });
         this.closeChat();
       } else {
+        e.preventDefault();
         this.input.reset();
         this.input.enabled = false;
         this.chatBox.value = '';
@@ -215,6 +230,7 @@ export class GameView {
   };
 
   private closeChat(): void {
+    this.chatBox.value = '';
     this.chatBox.classList.remove('open');
     this.chatBox.blur();
     this.input.enabled = true;
@@ -255,6 +271,10 @@ export class GameView {
         this.effects.push({ kind: 'splash', x, y, at: now, color: '#8fd0ff' });
         if (f.by) this.effects.push({ kind: 'text', x, y: y - 40, at: now, text: '擊破！', color: '#ff8a80' });
         break;
+      case 'crush':
+        this.effects.push({ kind: 'splash', x, y, at: now, color: '#f2c230' });
+        this.effects.push({ kind: 'text', x, y: y - 40, at: now, text: '壓扁！', color: '#ffcc80' });
+        break;
       case 'pick': {
         const t = ITEM_BY_CODE[f.item ?? ''];
         if (mine && t) {
@@ -287,9 +307,33 @@ export class GameView {
       case 'portal':
         this.audio.play('portal');
         break;
+      case 'warn':
+        this.audio.play('siren');
+        this.showBanner('縮圈警告！', now);
+        break;
+      case 'shrink':
+        this.shakeAt = now + 230; // the blocks take a moment to fall
+        window.setTimeout(() => this.audio.play('thud'), 230);
+        break;
+      case 'supply':
+        this.audio.play('chime');
+        this.showBanner('物資補給！', now);
+        break;
+      case 'land':
+        this.effects.push({ kind: 'splash', x, y, at: now, color: '#ffe082' });
+        break;
+      case 'spit':
+        this.spitAt = now;
+        this.audio.play('whoosh');
+        break;
       case 'end':
         break;
     }
+  }
+
+  private showBanner(text: string, now: number): void {
+    this.banner = text;
+    this.bannerAt = now;
   }
 
   private showResults(): void {
@@ -307,7 +351,7 @@ export class GameView {
           'tr',
           { class: r.winners.includes(p.id) ? 'win' : '' },
           h('td', null, `P${p.slot + 1}`),
-          h('td', null, p.name, p.id === me?.id ? '（你）' : ''),
+          h('td', null, p.name, p.id === me?.id ? '（你）' : p.bot !== undefined ? `（${BOT_LEVELS[p.bot]}）` : ''),
           h('td', null, `${ch.animal}${ch.name}`),
           h('td', null, String(st.kills)),
           h('td', null, String(st.rescues)),
@@ -351,14 +395,25 @@ export class GameView {
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = this.theme.panel;
     ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-    const t = this.clock.now();
-    const world = this.sample(t - DELAY);
-    if (!world || !this.grid) {
+    const t = this.clock.at(now);
+    while (this.pending.length && this.pending[0]!.k <= t) {
+      const { k, f } = this.pending.shift()!;
+      this.handleFx(f, k);
+    }
+    const world = this.sample(t - WORLD_EXTRA);
+    if (!world || !world.a.g) {
       this.label('載入中…', FIELD_W / 2, FIELD_H / 2, 20, '#fff');
       return;
     }
-    const self = this.me ? this.sample(t - SELF_DELAY) : null;
+    const self = this.me ? this.sample(t) : null;
+    this.warnBeep(self?.a ?? world.a);
+    const shake = now - this.shakeAt;
+    if (shake > 0 && shake < 320) {
+      const k = 1 - shake / 320;
+      ctx.translate(Math.sin(now / 21) * 4 * k, Math.cos(now / 17) * 3 * k);
+    }
     this.drawField(world, self, now);
+    ctx.setTransform(this.scale, 0, 0, this.scale, 0, 0);
     this.drawPanel(world.a);
     this.drawBar(self?.a ?? world.a);
     this.drawOverlay(world.a, now);
@@ -386,15 +441,26 @@ export class GameView {
     while (i > 0 && s[i]!.k > t) i--;
     const a = s[i]!;
     const b = s[i + 1] ?? null;
-    const f = b ? Math.max(0, Math.min(1, (t - a.k) / (b.k - a.k))) : 0;
-    return { a, b, f };
+    if (b) return { a, b, f: Math.max(0, Math.min(1, (t - a.k) / (b.k - a.k))), prev: null, ex: 0 };
+    return { a, b: null, f: 0, prev: s[i - 1] ?? null, ex: Math.max(0, Math.min(MAX_EXTRAPOLATE, t - a.k)) };
   }
 
   private playerAt(smp: Sample, id: string): SnapPlayer | undefined {
     const pa = smp.a.p.find((p) => p.i === id);
-    const pb = smp.b?.p.find((p) => p.i === id);
-    if (!pa || !pb || Math.abs(pb.x - pa.x) + Math.abs(pb.y - pa.y) > 60) return pa;
-    return { ...pa, x: pa.x + (pb.x - pa.x) * smp.f, y: pa.y + (pb.y - pa.y) * smp.f, a: pa.a + (pb.a - pa.a) * smp.f };
+    if (!pa) return undefined;
+    if (smp.b) {
+      const pb = smp.b.p.find((p) => p.i === id);
+      if (!pb || Math.abs(pb.x - pa.x) + Math.abs(pb.y - pa.y) > 60) return pa;
+      return { ...pa, x: pa.x + (pb.x - pa.x) * smp.f, y: pa.y + (pb.y - pa.y) * smp.f, a: pa.a + (pb.a - pa.a) * smp.f };
+    }
+    // the next snapshot is late: keep walking at the last known pace for a moment instead of freezing
+    const pp = smp.prev?.p.find((p) => p.i === id);
+    if (!pp || !smp.ex || smp.a.k === smp.prev!.k) return pa;
+    const per = smp.ex / (smp.a.k - smp.prev!.k);
+    const vx = pa.x - pp.x;
+    const vy = pa.y - pp.y;
+    if (Math.abs(vx) + Math.abs(vy) > 8) return pa; // teleported or launched: don't guess
+    return { ...pa, x: pa.x + vx * per, y: pa.y + vy * per };
   }
 
   private balloonAt(smp: Sample, b: SnapBalloon): SnapBalloon {
@@ -411,7 +477,14 @@ export class GameView {
   }
 
   private tileAt(x: number, y: number): string {
-    return this.grid[Math.floor(y / TILE) * COLS + Math.floor(x / TILE)] ?? '#';
+    return this.shownGrid[Math.floor(y / TILE) * COLS + Math.floor(x / TILE)] ?? '#';
+  }
+
+  /** Beeps the last seconds before a ring closes. */
+  private warnBeep(s: Snapshot): void {
+    const sec = s.zt > 0 && s.zt <= RULES.shrinkWarn ? Math.ceil(s.zt / TICK_RATE) : -1;
+    if (sec !== this.lastWarnSecond && sec > 0 && sec < Math.ceil(RULES.shrinkWarn / TICK_RATE)) this.audio.play('beep');
+    this.lastWarnSecond = sec;
   }
 
   // ---------------------------------------------------------------- field
@@ -419,6 +492,14 @@ export class GameView {
   private drawField(world: Sample, self: Sample | null, now: number): void {
     const ctx = this.ctx;
     const key = (MAPS[this.info.map] ?? MAPS[0]!).key;
+    const grid = world.a.g ?? this.grid;
+    const items = world.a.i ?? this.items;
+    if (grid !== this.shownGrid) {
+      // blocks that just appeared on a closing ring fall from the sky; on (re)join they are just there
+      const first = !this.shownGrid;
+      for (let i = 0; i < grid.length; i++) if (grid[i] === '%' && !this.closedAt.has(i)) this.closedAt.set(i, first ? 0 : now);
+      this.shownGrid = grid;
+    }
     ctx.save();
     ctx.beginPath();
     ctx.rect(0, 0, FIELD_W, FIELD_H);
@@ -429,8 +510,9 @@ export class GameView {
     const f4 = Math.floor(now / 110) % 4;
     const f8 = Math.floor(now / 90) % 8;
     const draws: { y: number; fn: () => void }[] = [];
-    for (let i = 0; i < this.grid.length; i++) {
-      const ch = this.grid[i]!;
+    const air: (() => void)[] = [];
+    for (let i = 0; i < grid.length; i++) {
+      const ch = grid[i]!;
       const x = (i % COLS) * TILE;
       const y = Math.floor(i / COLS) * TILE;
       if (ch === '~') ctx.drawImage(waterSprite(f2), x, y, TILE, TILE);
@@ -441,16 +523,21 @@ export class GameView {
       else if (ch === 'x') draws.push({ y: y + TILE, fn: () => ctx.drawImage(softSprite(key), x, y - 8, TILE, 48) });
       else if (ch === 'o') draws.push({ y: y + TILE, fn: () => ctx.drawImage(barrelSprite(), x, y - 8, TILE, 48) });
       else if (ch === '*') draws.push({ y: y + TILE + 0.1, fn: () => ctx.drawImage(bushSprite(key), x, y - 4, TILE, 44) });
-      const code = this.items[i];
+      else if (ch === '%') this.drawClosed(i, x, y, now, draws, air);
+      const code = items[i];
       const item = code && code !== '.' ? ITEM_BY_CODE[code] : undefined;
       if (item) draws.push({ y: y + 1, fn: () => this.drawItem(item, x, y, now, i) });
     }
+    if (this.machine) {
+      const m = this.machine;
+      draws.push({ y: m.y + TILE * 1.5, fn: () => this.drawMachine(world.a, now) });
+    }
+    this.drawWarning(world.a, now);
     for (const i of world.a.n) {
       ctx.drawImage(bananaSprite(), (i % COLS) * TILE + 8, Math.floor(i / COLS) * TILE + 10, 24, 24);
     }
     for (const e of world.a.e) this.drawBlast(e, now);
 
-    const air: (() => void)[] = [];
     for (const raw of world.a.b) {
       const b = this.balloonAt(world, raw);
       const hidden = this.tileAt(b.x, b.y) === '*';
@@ -479,6 +566,7 @@ export class GameView {
     draws.sort((a, b) => a.y - b.y);
     for (const d of draws) d.fn();
     for (const fn of air) fn();
+    this.drawDrops(world, now);
 
     ctx.strokeStyle = '#5d4037';
     ctx.lineWidth = 3;
@@ -497,6 +585,118 @@ export class GameView {
     this.drawEffects(now);
     if ((MAPS[this.info.map] ?? MAPS[0]!).night) this.drawNight(world, self);
     ctx.restore();
+  }
+
+  /** A block on a closed ring; it drops in over a quarter second when the ring closes. */
+  private drawClosed(i: number, x: number, y: number, now: number, draws: { y: number; fn: () => void }[], air: (() => void)[]): void {
+    const ctx = this.ctx;
+    const k = Math.min(1, (now - (this.closedAt.get(i) ?? 0)) / 230);
+    if (k >= 1) {
+      draws.push({ y: y + TILE, fn: () => ctx.drawImage(closedSprite(), x, y - 8, TILE, 48) });
+      return;
+    }
+    ctx.fillStyle = `rgba(0,0,0,${0.15 + 0.35 * k})`;
+    ctx.beginPath();
+    ctx.ellipse(x + TILE / 2, y + TILE / 2 + 6, 8 + 12 * k, 4 + 6 * k, 0, 0, Math.PI * 2);
+    ctx.fill();
+    const drop = (1 - k) * (1 - k) * 220;
+    air.push(() => ctx.drawImage(closedSprite(), x, y - 8 - drop, TILE, 48));
+  }
+
+  /** The ring that closes next flashes red, with a countdown, for the last seconds. */
+  private drawWarning(s: Snapshot, now: number): void {
+    if (!(s.zt > 0 && s.zt <= RULES.shrinkWarn)) return;
+    const ctx = this.ctx;
+    const pulse = 0.5 + 0.5 * Math.sin(now / 90);
+    for (let i = 0; i < this.shownGrid.length; i++) {
+      if (ringOf(i) !== s.zn || this.shownGrid[i] === '%') continue;
+      const x = (i % COLS) * TILE;
+      const y = Math.floor(i / COLS) * TILE;
+      ctx.fillStyle = `rgba(255,40,40,${0.18 + 0.2 * pulse})`;
+      ctx.fillRect(x, y, TILE, TILE);
+      ctx.globalAlpha = 0.25 + 0.3 * pulse;
+      ctx.drawImage(hazardSprite(), x, y, TILE, TILE);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  private drawMachine(s: Snapshot, now: number): void {
+    const m = this.machine;
+    if (!m) return;
+    const ctx = this.ctx;
+    const left = s.mc ?? RULES.machineEvery;
+    const charge = 1 - left / RULES.machineEvery;
+    const soon = left < TICK_RATE * 2;
+    const shake = soon ? Math.sin(now / 25) * 1.5 : 0;
+    const puff = now - this.spitAt < 250 ? 1 - (now - this.spitAt) / 250 : 0;
+    const x0 = m.x - TILE * 1.5 + shake;
+    const y0 = m.y - TILE * 1.5 - 24 - puff * 6;
+    ctx.drawImage(machineSprite(), x0, y0, 120, 144);
+    // charge bar in the gauge window, red light on top in the last two seconds
+    ctx.fillStyle = soon && Math.floor(now / 120) % 2 ? '#ff5252' : '#4dd0e1';
+    ctx.fillRect(x0 + 26, y0 + 82, 68 * charge, 12);
+    if (soon) {
+      ctx.fillStyle = Math.floor(now / 120) % 2 ? '#ff1744' : '#ffcdd2';
+      ctx.fillRect(x0 + 54, y0 + 4, 12, 6);
+    }
+    if (puff > 0) {
+      ctx.globalAlpha = puff;
+      ctx.fillStyle = '#ffffff';
+      for (let k = 0; k < 6; k++) {
+        const a = (k / 6) * Math.PI * 2 + now / 200;
+        ctx.beginPath();
+        ctx.arc(m.x + Math.cos(a) * 30 * (1.4 - puff), y0 + 20 + Math.sin(a) * 12, 7 * puff + 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /** Supply drops on their way down: a shadow grows on the landing tile while the parachute sinks. */
+  private drawDrops(world: Sample, now: number): void {
+    const ctx = this.ctx;
+    for (const [tile, code, ticks] of world.a.dr) {
+      const t = ITEM_BY_CODE[code];
+      if (!t) continue;
+      const left = Math.max(0, ticks - (world.b ? world.f : world.ex));
+      const k = 1 - left / RULES.supplyFall;
+      const x = (tile % COLS) * TILE + TILE / 2;
+      const y = Math.floor(tile / COLS) * TILE + TILE / 2;
+      ctx.strokeStyle = `rgba(255,224,130,${0.5 + 0.4 * Math.sin(now / 80)})`;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(x, y + 4, 16, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = `rgba(0,0,0,${0.1 + 0.25 * k})`;
+      ctx.beginPath();
+      ctx.ellipse(x, y + 12, 5 + 8 * k, 2 + 3 * k, 0, 0, Math.PI * 2);
+      ctx.fill();
+      const iy = y - (1 - k) * 170 - 2 + Math.sin(now / 160) * 2;
+      // canopy and lines
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x - 17, iy - 26);
+      ctx.lineTo(x - 6, iy - 6);
+      ctx.moveTo(x + 17, iy - 26);
+      ctx.lineTo(x + 6, iy - 6);
+      ctx.stroke();
+      for (let s = 0; s < 4; s++) {
+        ctx.fillStyle = s % 2 ? '#ffffff' : '#ff7043';
+        ctx.beginPath();
+        ctx.moveTo(x, iy - 28);
+        ctx.arc(x, iy - 26, 18, Math.PI + (s * Math.PI) / 4, Math.PI + ((s + 1) * Math.PI) / 4);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.beginPath();
+      ctx.arc(x, iy + 6, 13, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.drawImage(itemSprite(t), x - 12, iy - 6, 24, 24);
+    }
   }
 
   private drawItem(type: NonNullable<(typeof ITEM_BY_CODE)[string]>, x: number, y: number, now: number, i: number): void {
@@ -550,13 +750,13 @@ export class GameView {
     const fast = left < 0.3;
     const pulse = 1 + Math.sin(now / (fast ? 60 : 140)) * (fast ? 0.1 : 0.05);
     const size = 34 * pulse;
-    const lift = b.z > 0 ? Math.sin(b.z * Math.PI) * 44 : 0;
+    const lift = b.z > 0 ? Math.sin(b.z * Math.PI) * (owner ? 44 : 110) : 0; // the machine lobs them high
     ctx.globalAlpha = alpha;
     ctx.fillStyle = 'rgba(0,0,0,0.2)';
     ctx.beginPath();
     ctx.ellipse(b.x, b.y + 14, 12, 4, 0, 0, Math.PI * 2);
     ctx.fill();
-    ctx.drawImage(balloonSprite(owner?.color ?? 0), b.x - size / 2, b.y - size / 2 - 3 - lift, size, size);
+    ctx.drawImage(balloonSprite(owner ? owner.color : MACHINE_BALLOON), b.x - size / 2, b.y - size / 2 - 3 - lift, size, size);
     ctx.globalAlpha = 1;
   }
 
@@ -568,7 +768,7 @@ export class GameView {
     const jump = p.a > 0 ? Math.sin(p.a * Math.PI) * 26 : 0;
     const mount = MOUNT_BY_CODE[p.mt];
     let a = alpha;
-    if (p.dm > 0 && Math.floor(now / 60) % 2) a *= 0.4;
+    if (p.iv > 0 && Math.floor(now / 70) % 2) a *= 0.35; // just lost a mount: streams pass through
     if (p.dc) a *= 0.5;
     ctx.globalAlpha = a;
     ctx.fillStyle = 'rgba(0,0,0,0.22)';
@@ -734,6 +934,7 @@ export class GameView {
     for (const p of world.a.p) if (p.i !== me.i && p.s !== 2 && this.friend(p.i)) hole(p.x, p.y, 50, 0.6);
     m.globalCompositeOperation = 'source-over';
     this.ctx.drawImage(this.darkness, 0, 0);
+    this.drawWarning(world.a, performance.now()); // the warning shows through the dark
   }
 
   // ---------------------------------------------------------------- panels
@@ -806,8 +1007,23 @@ export class GameView {
         color = '#bdbdbd';
       }
       this.label(status, x0 + 76, y + 66, 12, color, 'left');
-      this.label(`${ch.animal}${ch.name}`, x0 + 76, y + 86, 11, 'rgba(255,255,255,0.6)', 'left');
+      const who = info.bot !== undefined ? ` · 電腦${BOT_LEVELS[info.bot]}` : '';
+      this.label(this.fitText(`${ch.animal}${ch.name}${who}`, 110, 11), x0 + 76, y + 86, 11, 'rgba(255,255,255,0.6)', 'left');
     });
+    // what the round has in store: the next ring, the balloon machine
+    let ly = 534;
+    if (s.zt >= 0 && (s.zt <= 15 * TICK_RATE || s.zn > 0)) {
+      const warn = s.zt <= RULES.shrinkWarn;
+      const text = `縮圈 ${Math.ceil(s.zt / TICK_RATE)} 秒（第 ${s.zn + 1}/${RULES.shrinkRings} 圈）`;
+      this.label(text, x0 + 100, ly, 12, warn && Math.floor(performance.now() / 200) % 2 ? '#ff8a80' : '#ffcc80');
+      ly += 20;
+    } else if (s.zt < 0 && s.zn > 0) {
+      this.label(`已縮完 ${s.zn} 圈`, x0 + 100, ly, 12, '#ffcc80');
+      ly += 20;
+    }
+    if (s.mc !== undefined && s.ph === 1) {
+      this.label(`水球機 ${Math.ceil(s.mc / TICK_RATE)} 秒後發射`, x0 + 100, ly, 12, s.mc < TICK_RATE * 2 ? '#ff8a80' : '#b3e5fc');
+    }
     this.label(`延遲 ${this.net.rtt} ms`, x0 + 100, VIEW_H - 14, 11, 'rgba(255,255,255,0.6)');
   }
 
@@ -879,8 +1095,9 @@ export class GameView {
       this.label('道具', 462, y0 + 40, 12, 'rgba(255,255,255,0.5)');
     }
     this.label('Ctrl / Z', 462, y0 + 77, 10, 'rgba(255,255,255,0.6)');
-    const hint = p.cu === 'r' ? '中了惡魔：方向顛倒！' : p.cu === 'a' ? '中了惡魔：停不下來放水球！' : '';
-    if (hint) this.label(hint, 300, y0 + 76, 12, '#ce93d8');
+    const hint =
+      p.cu === 'r' ? '中了惡魔：方向顛倒！' : p.cu === 'a' ? '中了惡魔：停不下來放水球！' : p.iv > 0 ? '坐騎掉了：短暫無敵' : '';
+    if (hint) this.label(hint, 300, y0 + 76, 12, p.cu ? '#ce93d8' : '#ffe082');
     this.label('方向鍵移動', 590, y0 + 26, 11, 'rgba(255,255,255,0.7)', 'right');
     this.label('Space 放水球', 590, y0 + 44, 11, 'rgba(255,255,255,0.7)', 'right');
     this.label('Enter 聊天 · M 靜音', 590, y0 + 62, 11, 'rgba(255,255,255,0.7)', 'right');
@@ -890,14 +1107,14 @@ export class GameView {
     const ctx = this.ctx;
     const cx = FIELD_W / 2;
     const cy = FIELD_H / 2;
-    const big = (text: string, color: string, size: number) => {
+    const big = (text: string, color: string, size: number, y = cy) => {
       ctx.font = `900 ${size}px ${FONT}`;
       ctx.textAlign = 'center';
       ctx.lineWidth = 8;
       ctx.strokeStyle = 'rgba(20,30,60,0.75)';
-      ctx.strokeText(text, cx, cy);
+      ctx.strokeText(text, cx, y);
       ctx.fillStyle = color;
-      ctx.fillText(text, cx, cy);
+      ctx.fillText(text, cx, y);
     };
     if (s.ph === 0) {
       const left = s.cd / TICK_RATE;
@@ -905,6 +1122,14 @@ export class GameView {
       big(String(Math.ceil(left)), '#fff', 72 + pop * 24);
     } else if (now - this.goAt < 700) {
       big('開始！', '#ffd54f', 64);
+    }
+    if (s.zt > 0 && s.zt <= RULES.shrinkWarn && s.ph === 1) {
+      big(`縮圈 ${Math.ceil(s.zt / TICK_RATE)}`, Math.floor(now / 150) % 2 ? '#ff5252' : '#ffcdd2', 34, 96);
+    } else if (this.banner && now - this.bannerAt < 1600) {
+      const k = Math.min(1, (now - this.bannerAt) / 180);
+      ctx.globalAlpha = Math.min(1, (1600 - (now - this.bannerAt)) / 300);
+      big(this.banner, this.banner.startsWith('縮圈') ? '#ff8a80' : '#ffe082', 24 + 12 * k, 96);
+      ctx.globalAlpha = 1;
     }
     if (this.result) {
       const me = this.me;

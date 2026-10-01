@@ -1,10 +1,12 @@
 import { TIME_OPTIONS } from '../shared/constants';
-import type { C2S } from '../shared/protocol';
+import { MAPS } from '../shared/maps';
+import type { BotLevel, C2S } from '../shared/protocol';
 import { isDir } from '../shared/types';
 
 const str = (v: unknown, max: number): string | null => (typeof v === 'string' && v.length <= max ? v : null);
 const int = (v: unknown, lo: number, hi: number): number | null =>
   typeof v === 'number' && Number.isInteger(v) && v >= lo && v <= hi ? v : null;
+const level = (v: unknown): BotLevel | null => (v === 0 || v === 1 || v === 2 ? v : null);
 
 /** Parses and validates one client message; anything malformed is dropped. */
 export function parseC2S(raw: string): C2S | null {
@@ -51,7 +53,7 @@ export function parseC2S(raw: string): C2S | null {
       const out: { t: 'config'; map?: number; mode?: 'ffa' | 'team'; assign?: 'free' | 'random'; time?: number } = {
         t: 'config',
       };
-      if (m.map !== undefined) out.map = int(m.map, -1, 9) ?? undefined;
+      if (m.map !== undefined) out.map = int(m.map, -1, MAPS.length - 1) ?? undefined;
       if (m.mode === 'ffa' || m.mode === 'team') out.mode = m.mode;
       if (m.assign === 'free' || m.assign === 'random') out.assign = m.assign;
       if (typeof m.time === 'number' && (TIME_OPTIONS as readonly number[]).includes(m.time)) out.time = m.time;
@@ -60,6 +62,20 @@ export function parseC2S(raw: string): C2S | null {
     case 'kick': {
       const id = str(m.id, 32);
       return id ? { t: 'kick', id } : null;
+    }
+    case 'addBot': {
+      const lv = level(m.level);
+      return lv === null ? null : { t: 'addBot', level: lv };
+    }
+    case 'setBot': {
+      const id = str(m.id, 32);
+      if (!id) return null;
+      const out: Extract<C2S, { t: 'setBot' }> = { t: 'setBot', id };
+      if (m.char !== undefined) out.char = int(m.char, 0, 5) ?? undefined;
+      if (m.color !== undefined) out.color = int(m.color, 0, 7) ?? undefined;
+      if (m.team !== undefined) out.team = int(m.team, 0, 1) ?? undefined;
+      if (m.level !== undefined) out.level = level(m.level) ?? undefined;
+      return out;
     }
     case 'start':
       return { t: 'start' };

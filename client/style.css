@@ -448,8 +448,36 @@ h4 {
   color: var(--muted);
 }
 
-.slot .btn.tiny {
+.slot > .btn.tiny {
   margin-left: auto;
+}
+
+.slot.empty {
+  flex-direction: column;
+  gap: 6px;
+}
+
+.slot.bot {
+  background: #f3f7ff;
+}
+
+.badge.bot {
+  background: #d8e6ff;
+  color: #234c9e;
+  margin-left: 0;
+}
+
+.bot-controls {
+  gap: 4px;
+}
+
+.mini {
+  font-family: inherit;
+  font-size: 12px;
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  padding: 1px 4px;
+  background: #fff;
 }
 
 .chars {

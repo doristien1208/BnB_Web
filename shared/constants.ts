@@ -1,3 +1,6 @@
+/** Shown on the entry screen and in /healthz, so a deployment can be checked at a glance. */
+export const VERSION = '0.2.0';
+
 export const TILE = 40;
 export const COLS = 15;
 export const ROWS = 13;
@@ -21,6 +24,7 @@ export const RULES = {
   trapped: sec(5),
   trappedSpeed: 20, // px/s, 0.5 tile/s
   dismount: sec(0.5),
+  mountInvuln: sec(1), // after losing a mount, streams cannot hit the rider (chained blasts count once)
   curse: sec(10),
   cloak: sec(10),
   portalCooldown: sec(1),
@@ -40,6 +44,20 @@ export const RULES = {
   laneSnap: 10, // px: max lane offset that still kicks a balloon or pushes a barrel ahead
   disconnectGrace: sec(30),
   resultsMs: 8000,
+  // shrink: from 55 s left, the outermost open ring closes every 10 s, 4 rings at most
+  shrinkStart: sec(55),
+  shrinkEvery: sec(10),
+  shrinkRings: 4,
+  shrinkWarn: sec(3), // the ring flashes this long before it closes
+  // supply drops: every 30 s, two basic items (balloon, potion or skate) fall onto random free tiles
+  supplyEvery: sec(30),
+  supplyCount: 2,
+  supplyFall: sec(1),
+  // the balloon machine in 水球工廠
+  machineEvery: sec(20),
+  machineMin: 4,
+  machineMax: 8,
+  machinePow: 2,
 } as const;
 
 /** Movement speed in px/s for speed level 1–10 (turtle = 1, UFO = 10). */

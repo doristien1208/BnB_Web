@@ -1,5 +1,6 @@
 import { CHARACTERS } from '../../shared/characters';
-import { h, store, toast } from '../dom';
+import { VERSION } from '../../shared/constants';
+import { h, isSubmitKey, store, toast } from '../dom';
 import { portrait } from './common';
 
 export function entryScreen(onEnter: (name: string) => void): HTMLElement {
@@ -19,7 +20,7 @@ export function entryScreen(onEnter: (name: string) => void): HTMLElement {
     store.set('bnb.name', name);
     onEnter(name);
   };
-  input.addEventListener('keydown', (e) => e.key === 'Enter' && go());
+  input.addEventListener('keydown', (e) => isSubmitKey(e) && go());
   const colors = [0, 5, 3, 1, 6, 7];
   const el = h(
     'div',
@@ -33,6 +34,7 @@ export function entryScreen(onEnter: (name: string) => void): HTMLElement {
       input,
       h('button', { class: 'btn primary big', onclick: go }, '進入大廳'),
       h('p', { class: 'hint' }, '方向鍵移動 · Space 放水球 · Ctrl / Z 用道具'),
+      h('p', { class: 'hint small' }, `v${VERSION}`),
     ),
   );
   requestAnimationFrame(() => input.focus());

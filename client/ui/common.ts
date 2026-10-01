@@ -2,7 +2,7 @@ import { CHARACTERS } from '../../shared/characters';
 import { COLS, ROWS } from '../../shared/constants';
 import { MAPS } from '../../shared/maps';
 import type { Audio } from '../audio';
-import { h } from '../dom';
+import { h, isSubmitKey } from '../dom';
 import { characterSprite } from '../game/art';
 import { THEMES } from '../game/themes';
 
@@ -52,6 +52,7 @@ export function mapPreview(id: number): HTMLImageElement {
         '^': '#4f5a63',
         v: '#4f5a63',
         '@': '#7e57c2',
+        M: '#4f8fc0',
       };
       map.grid.forEach((row, r) =>
         [...row].forEach((ch, c) => {
@@ -101,7 +102,7 @@ export function modal(
   };
   for (const i of inputs) {
     i.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') ok();
+      if (isSubmitKey(e)) ok();
       if (e.key === 'Escape') close();
     });
   }

@@ -16,7 +16,11 @@ export type Sfx =
   | 'go'
   | 'win'
   | 'lose'
-  | 'click';
+  | 'click'
+  | 'siren'
+  | 'thud'
+  | 'chime'
+  | 'whoosh';
 
 const NOTE: Record<string, number> = { C: 0, 'C#': 1, D: 2, 'D#': 3, E: 4, F: 5, 'F#': 6, G: 7, 'G#': 8, A: 9, 'A#': 10, B: 11 };
 const freq = (n: string) => {
@@ -144,6 +148,20 @@ export class Audio {
         break;
       case 'click':
         this.tone(t, 1200, 1200, 0.03, 'square', 0.1);
+        break;
+      case 'siren':
+        for (let k = 0; k < 4; k++) this.tone(t + k * 0.18, k % 2 ? 660 : 880, k % 2 ? 660 : 880, 0.16, 'square', 0.2);
+        break;
+      case 'thud':
+        this.noise(t, 0.35, 900, 80, 0.9);
+        this.tone(t, 110, 40, 0.35, 'sine', 0.8);
+        break;
+      case 'chime':
+        [784, 988, 1175, 1568].forEach((f, k) => this.tone(t + k * 0.07, f, f, 0.18, 'triangle', 0.25));
+        break;
+      case 'whoosh':
+        this.noise(t, 0.4, 600, 3000, 0.35);
+        [0, 0.08, 0.16].forEach((d) => this.tone(t + d, 500, 900, 0.08, 'square', 0.12));
         break;
     }
   }

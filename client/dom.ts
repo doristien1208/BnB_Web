@@ -25,6 +25,14 @@ export function h<K extends keyof HTMLElementTagNameMap>(
   return el;
 }
 
+/**
+ * Enter that should submit. While a Chinese IME is composing, Enter only confirms the composition
+ * (keyCode 229 covers Safari, which ends the composition before this keydown).
+ */
+export function isSubmitKey(e: KeyboardEvent): boolean {
+  return e.key === 'Enter' && !e.isComposing && e.keyCode !== 229;
+}
+
 export function clear(el: Element): void {
   while (el.firstChild) el.firstChild.remove();
 }

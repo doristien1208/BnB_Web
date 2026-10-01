@@ -1,10 +1,11 @@
-import { COLS, ROWS, RULES, TICK_RATE, TILE, speedPx } from '../constants';
+import { COLS, ROWS, RULES, TICK_RATE, TILE, sec, speedPx } from '../constants';
 import { CHARACTERS } from '../characters';
 import {
   ITEMS,
   ITEM_TYPES,
   MOUNT_CODE,
   MOUNT_SPEED,
+  SUPPLY_ITEMS,
   isActive,
   isMount,
   type ActiveType,
@@ -34,6 +35,14 @@ export const CONVEYOR: Readonly<Partial<Record<string, Dir>>> = { '^': 1, v: 2, 
 const FLOOR_LIKE = new Set(['.', '*', '=', '<', '>', '^', 'v', '@']);
 /** Tiles a player can stand on and a balloon can sit on. */
 export const isFloorLike = (t: string | undefined) => t !== undefined && FLOOR_LIKE.has(t);
+/** Tiles nothing gets through, not even a UFO or a stream: walls, rings closed by the shrink, the machine. */
+export const isSolid = (t: string | undefined) => t === undefined || t === '#' || t === '%' || t === 'M';
+/** Shrink ring of a tile: 0 for the outermost ring, 1 for the next one in, ... */
+export const ringOf = (i: number) => {
+  const c = i % COLS;
+  const r = Math.floor(i / COLS);
+  return Math.min(c, r, COLS - 1 - c, ROWS - 1 - r);
+};
 
 interface Flight {
   t: number;
@@ -63,6 +72,8 @@ export interface Player {
   state: PState;
   trapT: number;
   dismountT: number;
+  /** streams pass through the player while this runs (set when a mount is knocked off) */
+  invulnT: number;
   mount: MountType | null;
   bal: number;
   pow: number;
@@ -127,6 +138,13 @@ interface Dart {
   dir: Dir;
 }
 
+/** A supply drop on its way down; it becomes a floor item when `t` runs out. */
+export interface Drop {
+  tile: number;
+  item: ItemType;
+  t: number;
+}
+
 export interface GameOptions {
   mode: Mode;
   time: number;
@@ -144,6 +162,13 @@ export class Game {
   balloons: Balloon[] = [];
   blasts: Blast[] = [];
   darts: Dart[] = [];
+  drops: Drop[] = [];
+  /** rings the shrink has closed so far */
+  shrunk = 0;
+  /** centre tile of the balloon machine, on maps that have one */
+  readonly machine: { c: number; r: number } | null = null;
+  /** ticks until the machine fires */
+  machineT: number = RULES.machineEvery;
   tick = 0;
   phase: 'countdown' | 'play' | 'over' = 'countdown';
   countdown: number = RULES.countdown;
@@ -161,12 +186,17 @@ export class Game {
   private readonly dropTable: [ItemType, number][];
   private readonly dropTotal: number;
   private readonly initialSides: number;
+  /** rounds shorter than the shrink schedule never shrink */
+  private readonly shrinkOn: boolean;
+  /** ticks of play since the countdown ended */
+  private played = 0;
 
   constructor(map: MapDef, infos: readonly GamePlayerInfo[], opts: GameOptions) {
     this.map = map;
     this.mode = opts.mode;
     this.rng = new Rng(opts.seed);
     this.timeLeft = opts.time * TICK_RATE;
+    this.shrinkOn = this.timeLeft > RULES.shrinkStart + RULES.shrinkWarn;
     const spawns: [number, number][] = [];
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
@@ -178,6 +208,11 @@ export class Game {
           this.grid.push(ch);
         }
       }
+    }
+    const machine = this.grid.flatMap((t, i) => (t === 'M' ? [i] : []));
+    if (machine.length) {
+      const avg = (f: (i: number) => number) => Math.round(machine.reduce((s, i) => s + f(i), 0) / machine.length);
+      this.machine = { c: avg((i) => i % COLS), r: avg((i) => Math.floor(i / COLS)) };
     }
     this.items = new Array<ItemType | null>(TILE_COUNT).fill(null);
     this.bananas = new Array<string | null>(TILE_COUNT).fill(null);
@@ -238,13 +273,23 @@ export class Game {
       return;
     }
     this.timeLeft--;
+    this.played++;
+    this.updateShrink();
     for (const p of this.players) this.updatePlayer(p);
     this.updateDarts();
+    this.updateMachine();
     this.updateBalloons();
     this.explode();
     this.updateBlasts();
+    this.updateSupply();
     this.updateTrapped();
     this.checkEnd();
+  }
+
+  /** Ticks until the next ring closes, or -1 when no ring will close any more. */
+  shrinkIn(): number {
+    if (!this.shrinkOn || this.shrunk >= RULES.shrinkRings) return -1;
+    return Math.max(-1, this.timeLeft - (RULES.shrinkStart - this.shrunk * RULES.shrinkEvery));
   }
 
   snapshot(): Snapshot {
@@ -273,6 +318,7 @@ export class Game {
         n: p.activeN,
         cu: p.curse === 'reverse' ? 'r' : p.curse === 'auto' ? 'a' : '',
         cl: p.cloakT,
+        iv: p.invulnT,
         dc: p.connected ? 0 : 1,
       })),
       b: this.balloons.map((b) => ({
@@ -286,8 +332,12 @@ export class Game {
       e: this.blasts.map((bl) => ({ i: bl.id, c: bl.c, r: bl.r, a: bl.arms, t: bl.t })),
       d: this.darts.map((d) => ({ x: round1(d.x), y: round1(d.y), d: d.dir })),
       n: this.bananaTiles(),
+      zn: this.shrunk,
+      zt: this.shrinkIn(),
+      dr: this.drops.map((d): [number, string, number] => [d.tile, ITEMS[d.item].code, d.t]),
       fx: this.fx,
     };
+    if (this.machine) s.mc = this.machineT;
     this.fx = [];
     if (this.gridVersion !== this.sentGrid) {
       s.g = this.grid.join('');
@@ -347,6 +397,7 @@ export class Game {
       state: ALIVE,
       trapT: 0,
       dismountT: 0,
+      invulnT: 0,
       mount: null,
       bal: ch.bal[0],
       pow: ch.pow[0],
@@ -382,6 +433,7 @@ export class Game {
   private updatePlayer(p: Player): void {
     if (p.state === DEAD) return;
     if (p.portalCd > 0) p.portalCd--;
+    if (p.invulnT > 0) p.invulnT--;
     if (!p.connected) {
       p.in1 = 0;
       p.in2 = 0;
@@ -514,7 +566,7 @@ export class Game {
     const i = tileIndex(c, r);
     if (p.ghost.has(i)) return false;
     const t = this.grid[i];
-    if (t === '#') return true;
+    if (isSolid(t)) return true;
     if ((t === 'x' || t === 'o' || t === '~') && p.mount !== 'ufo') return true;
     const b = this.balloonAt(i);
     return !!b && !b.pass.has(p.id);
@@ -865,27 +917,36 @@ export class Game {
     }
   }
 
-  private landBalloon(b: Balloon): void {
+  /** Returns false when there is nowhere to land (the balloon is lost). */
+  private landBalloon(b: Balloon): boolean {
     const j = b.fly;
-    if (!j) return;
+    if (!j) return true;
     b.fly = null;
     const dx = Math.sign(j.tx - j.fx);
     const dy = Math.sign(j.ty - j.fy);
     let c = tileOf(j.tx);
     let r = tileOf(j.ty);
-    const taken = (i: number) => this.balloons.some((o) => o !== b && !o.fly && this.balloonTile(o) === i);
-    while (!isFloorLike(this.grid[tileIndex(c, r)]) || taken(tileIndex(c, r))) {
+    const free = (i: number) =>
+      isFloorLike(this.grid[i]) && !this.balloons.some((o) => o !== b && !o.fly && this.balloonTile(o) === i);
+    while (!free(tileIndex(c, r))) {
       if (!inBounds(c + dx, r + dy) || (dx === 0 && dy === 0)) break;
       c += dx;
       r += dy;
     }
-    b.x = tileCenter(c);
-    b.y = tileCenter(r);
-    const i = tileIndex(c, r);
+    let i = tileIndex(c, r);
+    if (!free(i)) {
+      // e.g. the target was on a ring that closed mid-flight: bounce to the nearest free floor
+      i = this.nearest(tileIndex(tileOf(j.tx), tileOf(j.ty)), free);
+      if (i < 0) return false;
+    }
+    b.x = tileCenter(i % COLS);
+    b.y = tileCenter(Math.floor(i / COLS));
     for (const q of this.players) if (q.state !== DEAD && this.overlapsTile(q, i)) b.pass.add(q.id);
+    return true;
   }
 
   private updateBalloons(): void {
+    const lost: Balloon[] = [];
     for (const b of this.balloons) {
       if (b.fly) {
         const j = b.fly;
@@ -893,7 +954,7 @@ export class Game {
         const f = Math.min(1, j.t / j.total);
         b.x = j.fx + (j.tx - j.fx) * f;
         b.y = j.fy + (j.ty - j.fy) * f;
-        if (j.t >= j.total) this.landBalloon(b);
+        if (j.t >= j.total && !this.landBalloon(b)) lost.push(b);
         continue; // the fuse waits while the balloon is in the air
       }
       if (b.move) this.advanceBalloon(b);
@@ -907,6 +968,7 @@ export class Game {
         }
       }
     }
+    if (lost.length) this.balloons = this.balloons.filter((b) => !lost.includes(b));
   }
 
   private advanceBalloon(b: Balloon): void {
@@ -1014,7 +1076,7 @@ export class Game {
         if (!inBounds(c, r)) return false;
         const i = tileIndex(c, r);
         const t = this.grid[i];
-        if (t === '#' || t === 'x' || t === 'o') return false;
+        if (isSolid(t) || t === 'x' || t === 'o') return false;
         if (i === d.start) continue;
         const b = this.balloonAt(i);
         if (b) {
@@ -1057,7 +1119,7 @@ export class Game {
           if (!inBounds(cc, rr)) break;
           const i = tileIndex(cc, rr);
           const t = this.grid[i];
-          if (t === '#') break;
+          if (isSolid(t)) break;
           blast.arms[d - 1] = k;
           blast.tiles.add(i);
           if (t === 'x' || t === 'o') {
@@ -1099,12 +1161,14 @@ export class Game {
         }
       }
       for (const p of this.players) {
-        if (p.state !== ALIVE || p.air || bl.hit.has(p.id)) continue;
+        if (p.state !== ALIVE || p.air || p.invulnT > 0 || bl.hit.has(p.id)) continue;
         if (!bl.tiles.has(tileIndex(p.tc, p.tr))) continue;
         bl.hit.add(p.id);
         if (p.mount) {
+          // the rider falls off; the other streams of a chain reaction pass through them
           p.mount = null;
           p.dismountT = RULES.dismount;
+          p.invulnT = RULES.mountInvuln;
           p.slide = 0;
           p.slideIce = false;
           this.unstick(p);
@@ -1163,7 +1227,7 @@ export class Game {
     }
   }
 
-  private kill(p: Player, by: Player | null): void {
+  private kill(p: Player, by: Player | null, crushed = false): void {
     if (p.state === DEAD) return;
     p.state = DEAD;
     p.trapT = 0;
@@ -1172,8 +1236,9 @@ export class Game {
     p.air = null;
     p.curse = null;
     p.cloakT = 0;
+    p.invulnT = 0;
     if (by) by.stats.kills++;
-    this.fx.push({ k: 'pop', id: p.id, by: by?.id, x: p.x, y: p.y });
+    this.fx.push({ k: crushed ? 'crush' : 'pop', id: p.id, by: by?.id, x: p.x, y: p.y });
     const spots = this.rng.shuffle(this.emptyTiles());
     for (const t of p.bag) {
       const i = spots.pop();
@@ -1199,7 +1264,150 @@ export class Game {
     this.fx.push({ k: 'end' });
   }
 
+  // ---------------------------------------------------------------- shrink
+
+  private updateShrink(): void {
+    const left = this.shrinkIn();
+    if (left === RULES.shrinkWarn) this.fx.push({ k: 'warn' });
+    if (left === 0) this.closeRing(this.shrunk++);
+  }
+
+  /** Ring `k` closes: blocks fall on it, and anything still standing there is crushed. */
+  private closeRing(k: number): void {
+    const ring = new Set<number>();
+    for (let i = 0; i < TILE_COUNT; i++) if (ringOf(i) === k) ring.add(i);
+    for (const i of ring) {
+      this.grid[i] = '%';
+      this.items[i] = null;
+      this.bananas[i] = null;
+    }
+    this.gridVersion++;
+    this.itemsVersion++;
+    this.balloons = this.balloons.filter((b) => {
+      if (b.fly) return true; // lands on free floor instead (landBalloon)
+      if (ring.has(this.balloonTile(b))) return false;
+      if (b.move && ring.has(b.move.to)) {
+        b.move = null;
+        b.x = tileCenter(tileOf(b.x));
+        b.y = tileCenter(tileOf(b.y));
+      }
+      return true;
+    });
+    // the open area after this ring is gone, as limits for a player's centre
+    const lo = (k + 1) * TILE + HALF;
+    const hiX = (COLS - 1 - k) * TILE - HALF;
+    const hiY = (ROWS - 1 - k) * TILE - HALF;
+    for (const p of this.players) {
+      if (p.state === DEAD) continue;
+      const landing = p.air ? tileIndex(tileOf(p.air.tx), tileOf(p.air.ty)) : -1;
+      if (ring.has(tileIndex(tileOf(p.x), tileOf(p.y))) || ring.has(landing)) {
+        this.kill(p, null, true);
+        continue;
+      }
+      // standing on the inner edge: the blocks push you fully inside
+      p.x = Math.max(lo, Math.min(hiX, p.x));
+      p.y = Math.max(lo, Math.min(hiY, p.y));
+      if (ring.has(tileIndex(p.tc, p.tr))) {
+        p.tc = tileOf(p.x);
+        p.tr = tileOf(p.y);
+      }
+    }
+    this.fx.push({ k: 'shrink' });
+  }
+
+  // ---------------------------------------------------------------- supply drops
+
+  private updateSupply(): void {
+    if (this.drops.length) {
+      for (const d of this.drops) {
+        if (--d.t > 0) continue;
+        let i = d.tile;
+        if (!this.isEmptyFloor(i)) i = this.rng.pick(this.openTiles().concat([-1])); // something got there first
+        if (i < 0) continue;
+        this.items[i] = d.item;
+        this.itemsVersion++;
+        this.fx.push({ k: 'land', x: tileCenter(i % COLS), y: tileCenter(Math.floor(i / COLS)) });
+      }
+      this.drops = this.drops.filter((d) => d.t > 0);
+    }
+    if (this.played % RULES.supplyEvery !== 0) return;
+    const spots = this.rng.shuffle(this.openTiles());
+    for (let k = 0; k < RULES.supplyCount && spots.length; k++) {
+      this.drops.push({ tile: spots.pop()!, item: this.rng.pick(SUPPLY_ITEMS), t: RULES.supplyFall });
+    }
+    if (this.drops.length) this.fx.push({ k: 'supply' });
+  }
+
+  /**
+   * Free floor for something falling from the sky: no item, balloon or player on it, not about to be
+   * closed by the shrink, and not already promised to another drop or a balloon in the air.
+   */
+  private openTiles(): number[] {
+    const closing = this.shrinkIn() >= 0 && this.shrinkIn() <= RULES.shrinkWarn + sec(1) ? this.shrunk : -1;
+    const taken = new Set(this.drops.map((d) => d.tile));
+    for (const b of this.balloons) if (b.fly) taken.add(tileIndex(tileOf(b.fly.tx), tileOf(b.fly.ty)));
+    const out: number[] = [];
+    for (let i = 0; i < TILE_COUNT; i++) {
+      if (!this.isEmptyFloor(i) || taken.has(i) || ringOf(i) === closing) continue;
+      if (this.players.some((p) => p.state !== DEAD && this.overlapsTile(p, i))) continue;
+      out.push(i);
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------- balloon machine
+
+  private updateMachine(): void {
+    const m = this.machine;
+    if (!m || --this.machineT > 0) return;
+    this.machineT = RULES.machineEvery;
+    const n = RULES.machineMin + this.rng.int(RULES.machineMax - RULES.machineMin + 1);
+    const spots = this.rng.shuffle(this.openTiles());
+    const fx = tileCenter(m.c);
+    const fy = tileCenter(m.r);
+    for (let k = 0; k < n && spots.length; k++) {
+      const i = spots.pop()!;
+      const c = i % COLS;
+      const r = Math.floor(i / COLS);
+      const total = sec(0.45) + Math.round(Math.hypot(c - m.c, r - m.r) * 3); // farther tiles fly longer
+      this.balloons.push({
+        id: this.nextId++,
+        owner: '', // the machine's: nobody's balloon count
+        x: fx,
+        y: fy,
+        fuse: RULES.fuse,
+        pow: RULES.machinePow,
+        pass: new Set(),
+        move: null,
+        fly: { t: 0, total, fx, fy, tx: tileCenter(c), ty: tileCenter(r) },
+      });
+    }
+    this.fx.push({ k: 'spit', x: fx, y: fy });
+  }
+
   // ---------------------------------------------------------------- helpers
+
+  /** Closest tile (by steps on the grid) to `from` that passes `ok`, or -1. */
+  private nearest(from: number, ok: (i: number) => boolean): number {
+    const seen = new Set([from]);
+    const queue = [from];
+    for (let k = 0; k < queue.length; k++) {
+      const i = queue[k]!;
+      if (ok(i)) return i;
+      const c = i % COLS;
+      const r = Math.floor(i / COLS);
+      for (let d = 1; d <= 4; d++) {
+        const nc = c + (DX[d] ?? 0);
+        const nr = r + (DY[d] ?? 0);
+        const j = tileIndex(nc, nr);
+        if (inBounds(nc, nr) && !seen.has(j)) {
+          seen.add(j);
+          queue.push(j);
+        }
+      }
+    }
+    return -1;
+  }
 
   private isEmptyFloor(i: number): boolean {
     return this.grid[i] === '.' && !this.items[i] && this.bananas[i] === null && !this.balloonAt(i);

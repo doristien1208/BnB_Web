@@ -2,12 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { COLS, ROWS } from '../shared/constants';
 import { MAPS } from '../shared/maps';
 
-const LEGAL = new Set([...'.#x*o~=<>^v@1234']);
+const LEGAL = new Set([...'.#x*o~=<>^v@M1234']);
 const FLIP_H: Record<string, string> = { '<': '>', '>': '<', '1': '2', '2': '1', '3': '4', '4': '3' };
 const FLIP_V: Record<string, string> = { '^': 'v', v: '^', '1': '3', '3': '1', '2': '4', '4': '2' };
 const at = (g: readonly string[], c: number, r: number) => (c < 0 || r < 0 || c >= COLS || r >= ROWS ? '#' : g[r]![c]!);
 const isFloor = (t: string) => t === '.' || '1234'.includes(t);
-const passable = (t: string) => t !== '#' && t !== '~';
+const passable = (t: string) => t !== '#' && t !== '~' && t !== 'M';
 
 describe.each(MAPS.map((m) => [m.name, m] as const))('%s', (_name, map) => {
   const g = map.grid;
@@ -84,6 +84,16 @@ describe.each(MAPS.map((m) => [m.name, m] as const))('%s', (_name, map) => {
     let walkable = 0;
     g.forEach((row) => [...row].forEach((t) => passable(t) && walkable++));
     expect(seen.size).toBe(walkable);
+  });
+
+  it('keeps the balloon machine a single 3x3 block in the middle', () => {
+    const cells = g.flatMap((row, r) => [...row].flatMap((t, c) => (t === 'M' ? [[c, r] as const] : [])));
+    if (!cells.length) return;
+    expect(cells).toHaveLength(9);
+    for (const [c, r] of cells) {
+      expect(Math.abs(c - (COLS - 1) / 2)).toBeLessThanOrEqual(1);
+      expect(Math.abs(r - (ROWS - 1) / 2)).toBeLessThanOrEqual(1);
+    }
   });
 
   it('pairs every portal with its point-symmetric twin', () => {

@@ -106,4 +106,52 @@ describe('server', () => {
     alice.close();
     bob.close();
   }, 15000);
+
+  it('fills seats with computer players that play the round', async () => {
+    const carol = new Bot();
+    await carol.open();
+    carol.send({ t: 'hello', name: 'Carol' });
+    const welcome = await carol.wait('welcome');
+    carol.send({ t: 'create', name: '電腦房' });
+    const room = await carol.wait('room');
+    carol.send({ t: 'start' });
+    await carol.wait('error', (m) => m.code === 'start'); // alone: not enough players yet
+
+    carol.send({ t: 'addBot', level: 2 });
+    carol.send({ t: 'addBot', level: 0 });
+    const full = await carol.wait('room', (m) => m.room.members.length === 3);
+    const bots = full.room.members.filter((m) => m.bot !== undefined);
+    expect(bots.map((m) => m.bot)).toEqual([2, 0]);
+    expect(bots.every((m) => m.ready && !m.host)).toBe(true);
+    expect(new Set(full.room.members.map((m) => m.slot)).size).toBe(3);
+
+    // the host sets a computer player up, and can take it out again
+    carol.send({ t: 'setBot', id: bots[1]!.id, level: 1, char: 4 });
+    await carol.wait('room', (m) => m.room.members.some((x) => x.id === bots[1]!.id && x.bot === 1 && x.char === 4));
+    carol.send({ t: 'kick', id: bots[1]!.id });
+    await carol.wait('room', (m) => m.room.members.length === 2);
+    carol.send({ t: 'addBot', level: 2 });
+    carol.send({ t: 'addBot', level: 2 });
+    carol.send({ t: 'addBot', level: 2 }); // a fifth seat does not exist
+    await carol.wait('error', (m) => m.code === 'full');
+    expect(app.hub.rooms.get(room.room.id)!.summary()).toMatchObject({ players: 4, bots: 3 });
+
+    carol.send({ t: 'config', map: 8 });
+    carol.send({ t: 'start' });
+    const start = await carol.wait('start');
+    expect(start.game.players.filter((p) => p.bot === 2)).toHaveLength(3);
+    const go = await carol.wait('snap', (m) => m.s.ph === 1);
+    const botIds = start.game.players.filter((p) => p.bot !== undefined).map((p) => p.id);
+    const startPos = new Map(go.s.p.map((p) => [p.i, `${p.x},${p.y}`]));
+    // computer players move on their own
+    await carol.wait('snap', (m) => m.s.p.some((p) => botIds.includes(p.i) && `${p.x},${p.y}` !== startPos.get(p.i)));
+    expect(welcome.id).toBeTruthy();
+
+    // when the last person leaves, the room closes even though computer players are still seated
+    carol.inbox.length = 0;
+    carol.send({ t: 'leave' });
+    await carol.wait('lobby', (m) => !m.rooms.some((r) => r.id === room.room.id));
+    expect(app.hub.rooms.has(room.room.id)).toBe(false);
+    carol.close();
+  }, 15000);
 });

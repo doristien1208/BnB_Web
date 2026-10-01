@@ -1,6 +1,6 @@
 {
   "name": "bnb-web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "水球大亂鬥：照爆爆王規則重製的網頁版 2–4 人連線對戰",
   "type": "module",

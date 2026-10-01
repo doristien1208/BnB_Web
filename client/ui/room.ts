@@ -1,10 +1,10 @@
 import { CHARACTERS } from '../../shared/characters';
 import { COLORS, TEAMS } from '../../shared/colors';
-import { TIME_OPTIONS } from '../../shared/constants';
+import { MAX_PLAYERS, TIME_OPTIONS } from '../../shared/constants';
 import { MAPS } from '../../shared/maps';
-import type { RoomMember, RoomView } from '../../shared/protocol';
+import { BOT_LEVELS, type BotLevel, type RoomMember, type RoomView } from '../../shared/protocol';
 import type { Audio } from '../audio';
-import { clear, h } from '../dom';
+import { clear, h, isSubmitKey } from '../dom';
 import type { Net } from '../net';
 import { mapPreview, portrait, settingsModal, stars } from './common';
 
@@ -100,7 +100,7 @@ export class RoomScreen {
         'button',
         { class: 'map-card', onclick: () => this.net.send({ t: 'config', map: id }) },
         mapPreview(id),
-        h('span', null, m ? `${id + 1}. ${m.name}` : '11. 隨機'),
+        h('span', null, m ? `${id + 1}. ${m.name}` : `${MAPS.length + 1}. 隨機`),
         h('em', null, m ? stars(m.stars) : '每局抽一張'),
       );
       this.mapCards.set(id, card);
@@ -112,7 +112,9 @@ export class RoomScreen {
       if (text) this.net.send({ t: 'chat', text });
       this.chatInput.value = '';
     };
-    this.chatInput.addEventListener('keydown', (e) => e.key === 'Enter' && send());
+    // with a Chinese IME, the first Enter only confirms the composition; sending then would leave the
+    // confirmed text behind in the box
+    this.chatInput.addEventListener('keydown', (e) => isSubmitKey(e) && send());
 
     this.el = h(
       'div',
@@ -172,7 +174,7 @@ export class RoomScreen {
 
     // players (sections are only rebuilt when their data changed, so buttons don't vanish mid-click)
     const slotData = view.members.map((m) => ({ ...m, ping: 0 }));
-    if (this.changed('slots', [slotData, cfg.mode, host])) this.renderSlots(view, host);
+    if (this.changed('slots', [slotData, cfg.mode, cfg.assign, view.phase, host])) this.renderSlots(view, host);
     for (const m of view.members) {
       const el = this.pingEls.get(m.id);
       if (el) el.textContent = m.connected ? `${m.ping} ms` : '斷線中';
@@ -201,7 +203,7 @@ export class RoomScreen {
     }
     if (this.changed('mapInfo', cfg.map)) this.renderMapInfo(cfg.map);
     if (this.changed('rules', [cfg, host])) this.renderRules(view, host);
-    const others = view.members.filter((m) => !m.host);
+    const others = view.members.filter((m) => !m.host && m.bot === undefined);
     const ready = others.filter((m) => m.ready).length;
     if (this.changed('action', [host, me?.ready, ready, others.length, view.members.length, cfg.mode])) {
       this.renderAction(view, host, ready, others.length);
@@ -219,10 +221,25 @@ export class RoomScreen {
     const cfg = view.config;
     clear(this.slots);
     this.pingEls.clear();
+    const full = view.members.length >= MAX_PLAYERS;
     for (let slot = 0; slot < 4; slot++) {
       const m = view.members.find((x) => x.slot === slot);
       if (!m) {
-        this.slots.append(h('div', { class: 'slot empty' }, h('span', { class: 'pnum' }, `P${slot + 1}`), '等待玩家加入…'));
+        this.slots.append(
+          h(
+            'div',
+            { class: 'slot empty' },
+            h('span', { class: 'pnum' }, `P${slot + 1}`),
+            h('span', null, '等待玩家加入…'),
+            host && !full && view.phase === 'waiting'
+              ? h('button', { class: 'btn tiny add-bot', onclick: () => this.net.send({ t: 'addBot', level: 1 }) }, '＋ 加入電腦')
+              : null,
+          ),
+        );
+        continue;
+      }
+      if (m.bot !== undefined) {
+        this.slots.append(this.botSlot(view, m, m.bot, host));
         continue;
       }
       const ch = CHARACTERS[m.char]!;
@@ -256,7 +273,63 @@ export class RoomScreen {
         ),
       );
     }
+  }
 
+  /** A computer player's seat; the host picks its character, colour, team and difficulty here. */
+  private botSlot(view: RoomView, m: RoomMember, level: BotLevel, host: boolean): HTMLElement {
+    const ch = CHARACTERS[m.char]!;
+    const cfg = view.config;
+    const team = cfg.mode === 'team' ? TEAMS[m.team] : undefined;
+    const set = (patch: { char?: number; color?: number; team?: number; level?: BotLevel }) =>
+      this.net.send({ t: 'setBot', id: m.id, ...patch });
+    const nextColor = () => {
+      const taken = (c: number) => view.members.some((o) => o.id !== m.id && o.char === m.char && o.color === c);
+      for (let k = 1; k <= COLORS.length; k++) {
+        const c = (m.color + k) % COLORS.length;
+        if (!taken(c)) return c;
+      }
+      return m.color;
+    };
+    const controls = host
+      ? h(
+          'div',
+          { class: 'row bot-controls' },
+          h(
+            'select',
+            { class: 'mini', title: '角色', onchange: (e: Event) => set({ char: Number((e.target as HTMLSelectElement).value) }) },
+            CHARACTERS.map((c) => h('option', { value: String(c.id), selected: c.id === m.char }, `${c.animal}${c.name}`)),
+          ),
+          h('button', { class: 'btn tiny', title: '換顏色', onclick: () => set({ color: nextColor() }) }, '換色'),
+          h(
+            'select',
+            { class: 'mini', title: '難度', onchange: (e: Event) => set({ level: Number((e.target as HTMLSelectElement).value) as BotLevel }) },
+            BOT_LEVELS.map((name, k) => h('option', { value: String(k), selected: k === level }, name)),
+          ),
+          team && cfg.assign === 'free'
+            ? h('button', { class: 'btn tiny', title: '換隊', onclick: () => set({ team: 1 - m.team }) }, '換隊')
+            : null,
+        )
+      : null;
+    return h(
+      'div',
+      { class: 'slot bot', style: { borderColor: COLORS[m.color]?.main ?? '#ccc' } },
+      h('span', { class: 'pnum' }, `P${m.slot + 1}`),
+      portrait(m.char, m.color, 3),
+      h(
+        'div',
+        { class: 'slot-info' },
+        h('strong', null, m.name),
+        h('span', { class: 'muted' }, `${ch.animal}「${ch.name}」· ${COLORS[m.color]?.name ?? ''}色`),
+        h(
+          'div',
+          { class: 'row' },
+          h('span', { class: 'badge bot' }, `電腦 · ${BOT_LEVELS[level]}`),
+          team ? h('span', { class: 'badge team', style: { background: team.ring } }, team.label) : null,
+        ),
+        controls,
+      ),
+      host ? h('button', { class: 'btn tiny', onclick: () => this.net.send({ t: 'kick', id: m.id }) }, '移除') : null,
+    );
   }
 
   private renderTeam(view: RoomView): void {
@@ -284,7 +357,7 @@ export class RoomScreen {
     this.mapInfo.append(
       map
         ? h('div', null, h('strong', null, `${map.name}（${map.tag}）`), h('span', { class: 'muted' }, `　${map.desc}`))
-        : h('div', null, h('strong', null, '隨機'), h('span', { class: 'muted' }, '　開局時從 10 張地圖抽一張，不與上一局重複')),
+        : h('div', null, h('strong', null, '隨機'), h('span', { class: 'muted' }, `　開局時從 ${MAPS.length} 張地圖抽一張，不與上一局重複`)),
     );
   }
 
@@ -338,7 +411,7 @@ export class RoomScreen {
         h(
           'p',
           { class: 'muted small' },
-          view.members.length < 2 ? '至少要 2 人' : `已準備 ${ready}/${others}`,
+          view.members.length < 2 ? '至少要 2 人，可以按「＋ 加入電腦」' : others ? `已準備 ${ready}/${others}` : '可以開始了',
           view.config.mode === 'team' ? '；團隊戰需 3–4 人' : '',
         ),
       );

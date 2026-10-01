@@ -3,6 +3,9 @@ import type { Dir } from './types';
 export type Mode = 'ffa' | 'team';
 export type TeamAssign = 'free' | 'random';
 export type RoomPhase = 'waiting' | 'playing' | 'results';
+/** Computer player difficulty: 0 easy, 1 normal, 2 hard. */
+export type BotLevel = 0 | 1 | 2;
+export const BOT_LEVELS = ['簡單', '普通', '困難'] as const;
 
 export interface PlayerStats {
   kills: number;
@@ -32,6 +35,7 @@ export interface SnapPlayer {
   n: number; // active item count
   cu: string; // curse: 'r' reverse, 'a' auto-balloon
   cl: number; // cloak ticks left
+  iv: number; // invulnerable ticks left (after losing a mount)
   dc: 0 | 1; // disconnected
 }
 
@@ -77,6 +81,12 @@ export type FxKind =
   | 'needle'
   | 'push'
   | 'portal'
+  | 'warn' // a ring starts flashing
+  | 'shrink' // a ring closed
+  | 'crush' // a player was on a closing ring
+  | 'supply' // supply drops are on their way
+  | 'land' // a supply drop landed
+  | 'spit' // the balloon machine fired
   | 'end';
 
 export interface Fx {
@@ -98,6 +108,10 @@ export interface Snapshot {
   e: SnapBlast[];
   d: SnapDart[];
   n: number[]; // banana tile indexes
+  zn: number; // rings closed by the shrink
+  zt: number; // ticks until the next ring closes (-1 = no more)
+  dr: [number, string, number][]; // supply drops in the air: tile, item code, ticks until they land
+  mc?: number; // balloon machine: ticks until it fires (maps with a machine only)
   g?: string; // tile grid, sent when it changed
   i?: string; // floor items, sent when they changed
   fx: Fx[];
@@ -110,6 +124,7 @@ export interface GamePlayerInfo {
   color: number;
   team: number; // -1 in free-for-all
   slot: number; // 0..3, shown as P1..P4
+  bot?: BotLevel; // computer players only
 }
 
 export interface GameStartInfo {
@@ -131,7 +146,8 @@ export interface RoomSummary {
   name: string;
   host: string;
   map: number;
-  players: number;
+  players: number; // computer players included
+  bots: number;
   phase: RoomPhase;
   locked: boolean;
 }
@@ -147,6 +163,7 @@ export interface RoomMember {
   host: boolean;
   connected: boolean;
   ping: number;
+  bot?: BotLevel; // computer players only
 }
 
 export interface RoomConfig {
@@ -175,7 +192,9 @@ export type C2S =
   | { t: 'ready'; ready: boolean }
   | { t: 'chat'; text: string }
   | { t: 'config'; map?: number; mode?: Mode; assign?: TeamAssign; time?: number }
-  | { t: 'kick'; id: string }
+  | { t: 'kick'; id: string } // also removes a computer player
+  | { t: 'addBot'; level: BotLevel }
+  | { t: 'setBot'; id: string; char?: number; color?: number; team?: number; level?: BotLevel }
   | { t: 'start' }
   | { t: 'in'; d: Dir; d2: Dir }
   | { t: 'act'; a: 'b' | 'u' }
