@@ -1,0 +1,1225 @@
+import { COLS, ROWS, RULES, TICK_RATE, TILE, speedPx } from '../constants';
+import { CHARACTERS } from '../characters';
+import {
+  ITEMS,
+  ITEM_TYPES,
+  MOUNT_CODE,
+  MOUNT_SPEED,
+  isActive,
+  isMount,
+  type ActiveType,
+  type ItemType,
+  type MountType,
+} from '../items';
+import type { MapDef } from '../maps';
+import type { Fx, GamePlayerInfo, GameResult, Mode, PlayerStats, Snapshot } from '../protocol';
+import { Rng } from '../rng';
+import { DX, DY, OPPOSITE, type Dir } from '../types';
+
+export const ALIVE = 0;
+export const TRAPPED = 1;
+export const DEAD = 2;
+type PState = typeof ALIVE | typeof TRAPPED | typeof DEAD;
+
+const HALF = RULES.hitbox / 2;
+export const TILE_COUNT = COLS * ROWS;
+export const tileIndex = (c: number, r: number) => r * COLS + c;
+export const inBounds = (c: number, r: number) => c >= 0 && r >= 0 && c < COLS && r < ROWS;
+export const tileOf = (v: number) => Math.floor(v / TILE);
+export const tileCenter = (t: number) => t * TILE + TILE / 2;
+const round1 = (v: number) => Math.round(v * 10) / 10;
+const round2 = (v: number) => Math.round(v * 100) / 100;
+
+export const CONVEYOR: Readonly<Partial<Record<string, Dir>>> = { '^': 1, v: 2, '<': 3, '>': 4 };
+const FLOOR_LIKE = new Set(['.', '*', '=', '<', '>', '^', 'v', '@']);
+/** Tiles a player can stand on and a balloon can sit on. */
+export const isFloorLike = (t: string | undefined) => t !== undefined && FLOOR_LIKE.has(t);
+
+interface Flight {
+  t: number;
+  total: number;
+  fx: number;
+  fy: number;
+  tx: number;
+  ty: number;
+}
+
+export interface Player {
+  id: string;
+  name: string;
+  char: number;
+  color: number;
+  team: number;
+  slot: number;
+  /** players on the same side are teammates; in free-for-all every player is their own side */
+  side: string;
+  x: number;
+  y: number;
+  face: Dir;
+  moving: boolean;
+  /** registered tile: where balloons are placed and hits are judged (lags behind by the hysteresis) */
+  tc: number;
+  tr: number;
+  state: PState;
+  trapT: number;
+  dismountT: number;
+  mount: MountType | null;
+  bal: number;
+  pow: number;
+  spd: number;
+  base: { bal: number; pow: number; spd: number };
+  cap: { bal: number; pow: number; spd: number };
+  kick: boolean;
+  glove: boolean;
+  /** stat items collected; scattered on death, one is spat out by the green devil */
+  bag: ItemType[];
+  curse: 'reverse' | 'auto' | null;
+  curseT: number;
+  cloakT: number;
+  active: ActiveType | null;
+  activeN: number;
+  slide: Dir;
+  slideIce: boolean;
+  portalCd: number;
+  air: Flight | null;
+  pushT: number;
+  pushDir: Dir;
+  /** blocked tiles this player may still walk out of (after losing a UFO, a teleport, ...) */
+  ghost: Set<number>;
+  in1: Dir;
+  in2: Dir;
+  actions: ('b' | 'u')[];
+  connected: boolean;
+  dcT: number;
+  stats: PlayerStats;
+}
+
+export interface Balloon {
+  id: number;
+  owner: string;
+  x: number;
+  y: number;
+  fuse: number;
+  pow: number;
+  /** players allowed to overlap the balloon: whoever stood on the tile when it was placed */
+  pass: Set<string>;
+  move: { dir: Dir; speed: number; kind: 'kick' | 'belt'; to: number } | null;
+  fly: Flight | null;
+}
+
+export interface Blast {
+  id: number;
+  c: number;
+  r: number;
+  arms: [number, number, number, number];
+  tiles: Set<number>;
+  t: number;
+  /** players this blast already hit; a player is hit at most once per blast */
+  hit: Set<string>;
+  reveal: [number, ItemType][];
+}
+
+interface Dart {
+  owner: string;
+  start: number;
+  x: number;
+  y: number;
+  dir: Dir;
+}
+
+export interface GameOptions {
+  mode: Mode;
+  time: number;
+  seed: number;
+}
+
+export class Game {
+  readonly map: MapDef;
+  readonly mode: Mode;
+  grid: string[] = [];
+  items: (ItemType | null)[];
+  /** side of the player who laid the banana, or null */
+  bananas: (string | null)[];
+  players: Player[];
+  balloons: Balloon[] = [];
+  blasts: Blast[] = [];
+  darts: Dart[] = [];
+  tick = 0;
+  phase: 'countdown' | 'play' | 'over' = 'countdown';
+  countdown: number = RULES.countdown;
+  timeLeft: number;
+  result: GameResult | null = null;
+
+  private fx: Fx[] = [];
+  private rng: Rng;
+  private nextId = 1;
+  private gridVersion = 0;
+  private itemsVersion = 0;
+  private sentGrid = -1;
+  private sentItems = -1;
+  private readonly dropRate: number;
+  private readonly dropTable: [ItemType, number][];
+  private readonly dropTotal: number;
+  private readonly initialSides: number;
+
+  constructor(map: MapDef, infos: readonly GamePlayerInfo[], opts: GameOptions) {
+    this.map = map;
+    this.mode = opts.mode;
+    this.rng = new Rng(opts.seed);
+    this.timeLeft = opts.time * TICK_RATE;
+    const spawns: [number, number][] = [];
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        const ch = map.grid[r]?.[c] ?? '#';
+        if (ch >= '1' && ch <= '4') {
+          spawns[Number(ch) - 1] = [c, r];
+          this.grid.push('.');
+        } else {
+          this.grid.push(ch);
+        }
+      }
+    }
+    this.items = new Array<ItemType | null>(TILE_COUNT).fill(null);
+    this.bananas = new Array<string | null>(TILE_COUNT).fill(null);
+    this.dropRate = map.dropRate ?? RULES.dropRate;
+    this.dropTable = ITEM_TYPES.map((t): [ItemType, number] => [t, map.weights?.[t] ?? ITEMS[t].weight]).filter(
+      ([, w]) => w > 0,
+    );
+    this.dropTotal = this.dropTable.reduce((s, [, w]) => s + w, 0);
+    const pos = this.assignSpawns(infos, spawns);
+    this.players = infos.map((info, k) => this.makePlayer(info, pos[k] ?? [0, 0]));
+    this.initialSides = new Set(this.players.map((p) => p.side)).size;
+  }
+
+  // ---------------------------------------------------------------- inputs
+
+  setInput(id: string, d1: Dir, d2: Dir): void {
+    const p = this.byId(id);
+    if (!p) return;
+    p.in1 = d1;
+    p.in2 = d1 === d2 ? 0 : d2;
+  }
+
+  pushAction(id: string, a: 'b' | 'u'): void {
+    const p = this.byId(id);
+    if (p && p.actions.length < 4) p.actions.push(a);
+  }
+
+  setConnected(id: string, on: boolean): void {
+    const p = this.byId(id);
+    if (!p) return;
+    p.connected = on;
+    if (on) p.dcT = 0;
+  }
+
+  /** Player left the room mid-game. */
+  forfeit(id: string): void {
+    const p = this.byId(id);
+    if (!p) return;
+    p.connected = false;
+    if (p.state !== DEAD && this.phase !== 'over') this.kill(p, null);
+  }
+
+  byId(id: string): Player | undefined {
+    return this.players.find((p) => p.id === id);
+  }
+
+  // ---------------------------------------------------------------- main loop
+
+  step(): void {
+    if (this.phase === 'over') return;
+    this.tick++;
+    if (this.phase === 'countdown') {
+      for (const p of this.players) p.actions.length = 0;
+      if (--this.countdown <= 0) {
+        this.phase = 'play';
+        this.fx.push({ k: 'go' });
+      }
+      return;
+    }
+    this.timeLeft--;
+    for (const p of this.players) this.updatePlayer(p);
+    this.updateDarts();
+    this.updateBalloons();
+    this.explode();
+    this.updateBlasts();
+    this.updateTrapped();
+    this.checkEnd();
+  }
+
+  snapshot(): Snapshot {
+    const s: Snapshot = {
+      k: this.tick,
+      ph: this.phase === 'countdown' ? 0 : this.phase === 'play' ? 1 : 2,
+      cd: this.countdown,
+      tl: this.timeLeft,
+      p: this.players.map((p) => ({
+        i: p.id,
+        x: round1(p.x),
+        y: round1(p.y),
+        f: p.face,
+        m: p.moving ? 1 : 0,
+        s: p.state,
+        tt: p.trapT,
+        dm: p.dismountT,
+        mt: p.mount ? MOUNT_CODE[p.mount] : '',
+        a: p.air ? round2(p.air.t / p.air.total) : 0,
+        b: p.bal,
+        w: p.pow,
+        v: p.spd,
+        k: p.kick ? 1 : 0,
+        g: p.glove ? 1 : 0,
+        it: p.active ? ITEMS[p.active].code : '',
+        n: p.activeN,
+        cu: p.curse === 'reverse' ? 'r' : p.curse === 'auto' ? 'a' : '',
+        cl: p.cloakT,
+        dc: p.connected ? 0 : 1,
+      })),
+      b: this.balloons.map((b) => ({
+        i: b.id,
+        x: round1(b.x),
+        y: round1(b.y),
+        o: b.owner,
+        f: b.fuse,
+        z: b.fly ? round2(b.fly.t / b.fly.total) : 0,
+      })),
+      e: this.blasts.map((bl) => ({ i: bl.id, c: bl.c, r: bl.r, a: bl.arms, t: bl.t })),
+      d: this.darts.map((d) => ({ x: round1(d.x), y: round1(d.y), d: d.dir })),
+      n: this.bananaTiles(),
+      fx: this.fx,
+    };
+    this.fx = [];
+    if (this.gridVersion !== this.sentGrid) {
+      s.g = this.grid.join('');
+      this.sentGrid = this.gridVersion;
+    }
+    if (this.itemsVersion !== this.sentItems) {
+      s.i = this.encodeItems();
+      this.sentItems = this.itemsVersion;
+    }
+    return s;
+  }
+
+  /** Grid and item layers for a client that (re)joins mid-game. */
+  staticLayers(): { g: string; i: string } {
+    return { g: this.grid.join(''), i: this.encodeItems() };
+  }
+
+  // ---------------------------------------------------------------- setup
+
+  private assignSpawns(infos: readonly GamePlayerInfo[], spawns: [number, number][]): [number, number][] {
+    // spawn indexes: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
+    if (this.mode === 'team') {
+      const prefs = [
+        [0, 2, 1, 3],
+        [1, 3, 0, 2],
+      ];
+      const used = new Set<number>();
+      const chosen: number[] = [];
+      for (const k of this.rng.shuffle(infos.map((_, k) => k))) {
+        const pref = prefs[infos[k]?.team === 1 ? 1 : 0] ?? [];
+        const s = pref.find((s) => !used.has(s)) ?? 0;
+        used.add(s);
+        chosen[k] = s;
+      }
+      return chosen.map((s) => spawns[s] ?? [0, 0]);
+    }
+    const order = this.rng.shuffle([0, 1, 2, 3]);
+    return infos.map((_, k) => spawns[order[k] ?? 0] ?? [0, 0]);
+  }
+
+  private makePlayer(info: GamePlayerInfo, [c, r]: [number, number]): Player {
+    const ch = CHARACTERS[info.char] ?? CHARACTERS[0]!;
+    return {
+      id: info.id,
+      name: info.name,
+      char: info.char,
+      color: info.color,
+      team: info.team,
+      slot: info.slot,
+      side: this.mode === 'team' ? `team${info.team}` : info.id,
+      x: tileCenter(c),
+      y: tileCenter(r),
+      face: 2,
+      moving: false,
+      tc: c,
+      tr: r,
+      state: ALIVE,
+      trapT: 0,
+      dismountT: 0,
+      mount: null,
+      bal: ch.bal[0],
+      pow: ch.pow[0],
+      spd: ch.spd[0],
+      base: { bal: ch.bal[0], pow: ch.pow[0], spd: ch.spd[0] },
+      cap: { bal: ch.bal[1], pow: ch.pow[1], spd: ch.spd[1] },
+      kick: false,
+      glove: false,
+      bag: [],
+      curse: null,
+      curseT: 0,
+      cloakT: 0,
+      active: null,
+      activeN: 0,
+      slide: 0,
+      slideIce: false,
+      portalCd: 0,
+      air: null,
+      pushT: 0,
+      pushDir: 0,
+      ghost: new Set(),
+      in1: 0,
+      in2: 0,
+      actions: [],
+      connected: true,
+      dcT: 0,
+      stats: { kills: 0, rescues: 0, trapped: 0, items: 0 },
+    };
+  }
+
+  // ---------------------------------------------------------------- players
+
+  private updatePlayer(p: Player): void {
+    if (p.state === DEAD) return;
+    if (p.portalCd > 0) p.portalCd--;
+    if (!p.connected) {
+      p.in1 = 0;
+      p.in2 = 0;
+      p.actions.length = 0;
+      if (++p.dcT >= RULES.disconnectGrace) {
+        this.kill(p, null);
+        return;
+      }
+    }
+    const actions = p.actions.splice(0);
+    if (p.state === TRAPPED) {
+      if (actions.includes('u') && p.active === 'needle') {
+        this.useNeedle(p);
+      } else if (p.in1) {
+        this.unstick(p);
+        this.moveDir(p, p.in1, RULES.trappedSpeed / TICK_RATE);
+        this.afterMove(p);
+      }
+      return;
+    }
+    if (p.air) {
+      this.updateJump(p);
+      return;
+    }
+    if (p.dismountT > 0) {
+      p.dismountT--;
+      return;
+    }
+    for (const a of actions) {
+      if (a === 'b') this.placeBalloon(p);
+      else this.useActive(p);
+    }
+    if (p.curse) {
+      if (p.curse === 'auto') this.placeBalloon(p);
+      if (--p.curseT <= 0) p.curse = null;
+    }
+    if (p.cloakT > 0) p.cloakT--;
+
+    this.unstick(p);
+    const speed = speedPx(p.mount ? MOUNT_SPEED[p.mount] : p.spd) / TICK_RATE;
+    let d1 = p.in1;
+    let d2 = p.in2;
+    if (p.curse === 'reverse') {
+      d1 = OPPOSITE[d1] ?? 0;
+      d2 = OPPOSITE[d2] ?? 0;
+    }
+    let moved: Dir = 0;
+    if (p.slide) {
+      if (this.moveDir(p, p.slide, speed)) moved = p.slide;
+      else {
+        p.slide = 0;
+        p.slideIce = false;
+      }
+      p.pushT = 0;
+    } else {
+      if (d1 && this.moveDir(p, d1, speed)) moved = d1;
+      else if (d2 && this.moveDir(p, d2, speed)) moved = d2;
+      if (!moved && d1) this.interactAhead(p, d1);
+      else p.pushT = 0;
+      if (moved) p.face = moved;
+      else if (d1) p.face = d1;
+    }
+    p.moving = moved !== 0;
+
+    const belt = CONVEYOR[this.tileUnder(p)];
+    if (belt && p.mount !== 'ufo') this.moveDir(p, belt, RULES.conveyorSpeed / TICK_RATE);
+    this.afterMove(p);
+
+    const under = this.tileUnder(p);
+    if (p.slideIce && under !== '=') {
+      p.slide = 0;
+      p.slideIce = false;
+    } else if (!p.slide && under === '=' && moved && p.mount !== 'ufo') {
+      p.slide = moved;
+      p.slideIce = true;
+    }
+    this.checkBanana(p);
+    this.checkPortal(p);
+    this.pickup(p);
+  }
+
+  private tileUnder(p: Player): string {
+    return this.grid[tileIndex(tileOf(p.x), tileOf(p.y))] ?? '#';
+  }
+
+  private afterMove(p: Player): void {
+    this.updateTile(p);
+    for (const i of p.ghost) if (!this.overlapsTile(p, i)) p.ghost.delete(i);
+  }
+
+  /** Registered tile changes only once the centre is clearly past the tile edge. */
+  private updateTile(p: Player): void {
+    const c = tileOf(p.x);
+    const r = tileOf(p.y);
+    if (c !== p.tc) {
+      const past = c > p.tc ? p.x - c * TILE : p.tc * TILE - p.x;
+      if (past >= RULES.tileHysteresis || Math.abs(c - p.tc) > 1) p.tc = c;
+    }
+    if (r !== p.tr) {
+      const past = r > p.tr ? p.y - r * TILE : p.tr * TILE - p.y;
+      if (past >= RULES.tileHysteresis || Math.abs(r - p.tr) > 1) p.tr = r;
+    }
+  }
+
+  /** Safety net: if the player overlaps tiles that block them, let them walk out. */
+  private unstick(p: Player): void {
+    this.forBoxTiles(p.x, p.y, (c, r) => {
+      if (this.blockedFor(p, c, r) && inBounds(c, r)) p.ghost.add(tileIndex(c, r));
+    });
+  }
+
+  private forBoxTiles(x: number, y: number, fn: (c: number, r: number) => void): void {
+    const c0 = tileOf(x - HALF);
+    const c1 = tileOf(x + HALF - 0.001);
+    const r0 = tileOf(y - HALF);
+    const r1 = tileOf(y + HALF - 0.001);
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) fn(c, r);
+  }
+
+  private overlapsTile(p: Player, i: number): boolean {
+    const c = i % COLS;
+    const r = Math.floor(i / COLS);
+    return (
+      p.x + HALF > c * TILE && p.x - HALF < (c + 1) * TILE && p.y + HALF > r * TILE && p.y - HALF < (r + 1) * TILE
+    );
+  }
+
+  private blockedFor(p: Player, c: number, r: number): boolean {
+    if (!inBounds(c, r)) return true;
+    const i = tileIndex(c, r);
+    if (p.ghost.has(i)) return false;
+    const t = this.grid[i];
+    if (t === '#') return true;
+    if ((t === 'x' || t === 'o' || t === '~') && p.mount !== 'ufo') return true;
+    const b = this.balloonAt(i);
+    return !!b && !b.pass.has(p.id);
+  }
+
+  private boxBlocked(p: Player, x: number, y: number): boolean {
+    let blocked = false;
+    this.forBoxTiles(x, y, (c, r) => {
+      if (!blocked && this.blockedFor(p, c, r)) blocked = true;
+    });
+    return blocked;
+  }
+
+  /** Moves along one axis with collision; slides around corners like the original. */
+  private moveDir(p: Player, dir: Dir, dist: number): boolean {
+    const dx = DX[dir] ?? 0;
+    const dy = DY[dir] ?? 0;
+    let left = dist;
+    let moved = false;
+    while (left > 1e-6) {
+      const step = Math.min(left, 4);
+      left -= step;
+      if (!this.boxBlocked(p, p.x + dx * step, p.y + dy * step)) {
+        p.x += dx * step;
+        p.y += dy * step;
+        moved = true;
+        continue;
+      }
+      let lo = 0;
+      let hi = step;
+      for (let k = 0; k < 7; k++) {
+        const mid = (lo + hi) / 2;
+        if (this.boxBlocked(p, p.x + dx * mid, p.y + dy * mid)) hi = mid;
+        else lo = mid;
+      }
+      if (lo > 0.01) {
+        p.x += dx * lo;
+        p.y += dy * lo;
+        moved = true;
+      }
+      if (this.cornerAssist(p, dir, step - lo)) {
+        moved = true;
+        continue;
+      }
+      break;
+    }
+    return moved;
+  }
+
+  private cornerAssist(p: Player, dir: Dir, budget: number): boolean {
+    if (budget <= 1e-6) return false;
+    const horizontal = DX[dir] !== 0;
+    const lanePos = horizontal ? p.y : p.x;
+    const along = horizontal ? p.x : p.y;
+    const sign = horizontal ? (DX[dir] ?? 0) : (DY[dir] ?? 0);
+    const ahead = tileOf(along + sign * (HALF + 0.5));
+    const l0 = tileOf(lanePos - HALF);
+    const l1 = tileOf(lanePos + HALF - 0.001);
+    const lc = tileOf(lanePos);
+    for (const lane of lc === l0 ? [l0, l1] : [l1, l0]) {
+      const c = horizontal ? ahead : lane;
+      const r = horizontal ? lane : ahead;
+      if (this.blockedFor(p, c, r)) continue;
+      const diff = tileCenter(lane) - lanePos;
+      if (Math.abs(diff) < 0.01) return false;
+      const s = Math.sign(diff) * Math.min(Math.abs(diff), budget);
+      const nx = horizontal ? p.x : p.x + s;
+      const ny = horizontal ? p.y + s : p.y;
+      if (this.boxBlocked(p, nx, ny)) return false;
+      p.x = nx;
+      p.y = ny;
+      return true;
+    }
+    return false;
+  }
+
+  /** Walking into a balloon kicks it (with shoes); walking into a barrel pushes it. */
+  private interactAhead(p: Player, d: Dir): void {
+    const c = tileOf(p.x);
+    const r = tileOf(p.y);
+    const off = DX[d] !== 0 ? p.y - tileCenter(r) : p.x - tileCenter(c);
+    const ac = c + (DX[d] ?? 0);
+    const ar = r + (DY[d] ?? 0);
+    if (Math.abs(off) > RULES.laneSnap || !inBounds(ac, ar)) {
+      p.pushT = 0;
+      return;
+    }
+    const ai = tileIndex(ac, ar);
+    const b = this.balloonAt(ai);
+    if (b) {
+      p.pushT = 0;
+      if (p.kick && !b.move && !b.pass.has(p.id)) this.kick(b, d, p);
+      return;
+    }
+    if (this.grid[ai] === 'o' && p.mount !== 'ufo') {
+      if (p.pushDir !== d) {
+        p.pushDir = d;
+        p.pushT = 0;
+      }
+      if (++p.pushT >= RULES.pushDelay) {
+        p.pushT = 0;
+        this.pushBarrel(ac, ar, d);
+      }
+      return;
+    }
+    p.pushT = 0;
+  }
+
+  private pushBarrel(c: number, r: number, d: Dir): void {
+    const nc = c + (DX[d] ?? 0);
+    const nr = r + (DY[d] ?? 0);
+    if (!inBounds(nc, nr)) return;
+    const to = tileIndex(nc, nr);
+    if (this.grid[to] !== '.' || this.items[to] || this.bananas[to] !== null || this.balloonAt(to)) return;
+    if (this.players.some((q) => q.state !== DEAD && this.overlapsTile(q, to))) return;
+    this.grid[to] = 'o';
+    this.grid[tileIndex(c, r)] = '.';
+    this.gridVersion++;
+    this.fx.push({ k: 'push', x: tileCenter(nc), y: tileCenter(nr) });
+  }
+
+  private updateJump(p: Player): void {
+    const j = p.air;
+    if (!j) return;
+    j.t++;
+    const f = Math.min(1, j.t / j.total);
+    p.x = j.fx + (j.tx - j.fx) * f;
+    p.y = j.fy + (j.ty - j.fy) * f;
+    if (j.t >= j.total) {
+      p.air = null;
+      p.tc = tileOf(p.x);
+      p.tr = tileOf(p.y);
+      this.unstick(p);
+      this.pickup(p);
+    }
+  }
+
+  private checkBanana(p: Player): void {
+    if (p.mount === 'ufo' || p.slide) return;
+    const i = tileIndex(p.tc, p.tr);
+    const side = this.bananas[i];
+    if (side === null || side === undefined || side === p.side) return;
+    if (Math.abs(p.x - tileCenter(p.tc)) > 10 || Math.abs(p.y - tileCenter(p.tr)) > 10) return;
+    this.bananas[i] = null;
+    p.slide = p.face || 2;
+    p.slideIce = false;
+    this.fx.push({ k: 'slip', id: p.id, x: p.x, y: p.y });
+  }
+
+  private checkPortal(p: Player): void {
+    if (p.portalCd > 0) return;
+    const c = tileOf(p.x);
+    const r = tileOf(p.y);
+    if (this.grid[tileIndex(c, r)] !== '@') return;
+    if (Math.abs(p.x - tileCenter(c)) > 4 || Math.abs(p.y - tileCenter(r)) > 4) return;
+    const tc = COLS - 1 - c;
+    const tr = ROWS - 1 - r;
+    if (this.grid[tileIndex(tc, tr)] !== '@') return;
+    p.x = tileCenter(tc);
+    p.y = tileCenter(tr);
+    p.tc = tc;
+    p.tr = tr;
+    p.portalCd = RULES.portalCooldown;
+    p.slide = 0;
+    p.slideIce = false;
+    this.unstick(p);
+    this.fx.push({ k: 'portal', id: p.id, x: p.x, y: p.y });
+  }
+
+  private pickup(p: Player): void {
+    if (p.state !== ALIVE || p.air || p.mount === 'ufo') return;
+    const i = tileIndex(p.tc, p.tr);
+    const it = this.items[i];
+    if (!it) return;
+    this.items[i] = null;
+    this.itemsVersion++;
+    this.applyItem(p, it);
+  }
+
+  private applyItem(p: Player, t: ItemType): void {
+    switch (t) {
+      case 'bubble':
+        if (p.bal < p.cap.bal) {
+          p.bal++;
+          p.bag.push(t);
+        }
+        break;
+      case 'potion':
+        if (p.pow < p.cap.pow) {
+          p.pow++;
+          p.bag.push(t);
+        }
+        break;
+      case 'skate':
+        if (p.spd < p.cap.spd) {
+          p.spd++;
+          p.bag.push(t);
+        }
+        break;
+      case 'ultra':
+        p.pow = p.cap.pow;
+        p.bag.push(t);
+        break;
+      case 'redDevil':
+        p.spd = p.cap.spd;
+        p.kick = true;
+        p.bag.push(t);
+        break;
+      case 'iceSkate':
+        p.spd = p.cap.spd;
+        p.bag.push(t);
+        break;
+      case 'shoe':
+        p.kick = true;
+        p.bag.push(t);
+        break;
+      case 'glove':
+        p.glove = true;
+        p.bag.push(t);
+        break;
+      case 'greenDevil':
+        this.greenDevil(p);
+        break;
+      case 'devil':
+        p.curse = this.rng.next() < 0.5 ? 'reverse' : 'auto';
+        p.curseT = RULES.curse;
+        break;
+      case 'cloak':
+        p.cloakT = RULES.cloak;
+        break;
+      default:
+        if (isMount(t)) {
+          p.mount = t;
+          p.slide = 0;
+          p.slideIce = false;
+        } else if (isActive(t)) {
+          const n = t === 'needle' ? 1 : t === 'banana' ? this.rng.pick([1, 3, 5]) : 3;
+          if (p.active === t) p.activeN += n;
+          else {
+            p.active = t;
+            p.activeN = n;
+          }
+        }
+    }
+    p.stats.items++;
+    this.fx.push({ k: 'pick', id: p.id, item: ITEMS[t].code, x: p.x, y: p.y });
+  }
+
+  private greenDevil(p: Player): void {
+    const basics: number[] = [];
+    p.bag.forEach((t, k) => {
+      if (t === 'bubble' || t === 'potion' || t === 'skate') basics.push(k);
+    });
+    if (!basics.length) return;
+    const k = this.rng.pick(basics);
+    const [t] = p.bag.splice(k, 1);
+    if (t === 'bubble') p.bal = Math.max(p.base.bal, p.bal - 1);
+    else if (t === 'potion') p.pow = Math.max(p.base.pow, p.pow - 1);
+    else if (t === 'skate') p.spd = Math.max(p.base.spd, p.spd - 1);
+    if (!t) return;
+    const near: number[] = [];
+    for (let dr = -2; dr <= 2; dr++) {
+      for (let dc = -2; dc <= 2; dc++) {
+        const c = p.tc + dc;
+        const r = p.tr + dr;
+        if ((dc || dr) && inBounds(c, r) && this.isEmptyFloor(tileIndex(c, r))) near.push(tileIndex(c, r));
+      }
+    }
+    const spot = near.length ? this.rng.pick(near) : this.rng.pick(this.emptyTiles().concat([-1]));
+    if (spot >= 0) {
+      this.items[spot] = t;
+      this.itemsVersion++;
+    }
+  }
+
+  // ---------------------------------------------------------------- balloons
+
+  private balloonTile(b: Balloon): number {
+    return tileIndex(tileOf(b.x), tileOf(b.y));
+  }
+
+  private balloonAt(i: number): Balloon | undefined {
+    return this.balloons.find((b) => !b.fly && this.balloonTile(b) === i);
+  }
+
+  private placeBalloon(p: Player): void {
+    if (p.state !== ALIVE || p.air || p.dismountT > 0) return;
+    const i = tileIndex(p.tc, p.tr);
+    if (!isFloorLike(this.grid[i])) return;
+    const existing = this.balloonAt(i);
+    if (existing) {
+      if (p.glove && existing.owner === p.id && existing.pass.has(p.id) && !existing.move) {
+        this.throwBalloon(existing, p.face || 2, p);
+      }
+      return;
+    }
+    if (this.balloons.filter((b) => b.owner === p.id).length >= p.bal) return;
+    const b: Balloon = {
+      id: this.nextId++,
+      owner: p.id,
+      x: tileCenter(p.tc),
+      y: tileCenter(p.tr),
+      fuse: RULES.fuse,
+      pow: p.pow,
+      pass: new Set(),
+      move: null,
+      fly: null,
+    };
+    for (const q of this.players) if (q.state !== DEAD && this.overlapsTile(q, i)) b.pass.add(q.id);
+    this.balloons.push(b);
+    this.fx.push({ k: 'place', x: b.x, y: b.y, id: p.id });
+  }
+
+  private kick(b: Balloon, d: Dir, p: Player): void {
+    const to = this.nextBalloonTile(b, tileOf(b.x), tileOf(b.y), d);
+    if (to < 0) return;
+    b.move = { dir: d, speed: RULES.kickSpeed / TICK_RATE, kind: 'kick', to };
+    this.fx.push({ k: 'kick', x: b.x, y: b.y, id: p.id });
+  }
+
+  /** Next tile a sliding balloon may enter, or -1 when something is in the way. */
+  private nextBalloonTile(b: Balloon, c: number, r: number, d: Dir): number {
+    const nc = c + (DX[d] ?? 0);
+    const nr = r + (DY[d] ?? 0);
+    if (!inBounds(nc, nr)) return -1;
+    const i = tileIndex(nc, nr);
+    if (!isFloorLike(this.grid[i])) return -1;
+    if (this.balloons.some((o) => o !== b && !o.fly && (this.balloonTile(o) === i || o.move?.to === i))) return -1;
+    if (this.players.some((q) => q.state !== DEAD && !q.air && this.overlapsTile(q, i))) return -1;
+    return i;
+  }
+
+  private throwBalloon(b: Balloon, d: Dir, p: Player): void {
+    const c = tileOf(b.x);
+    const r = tileOf(b.y);
+    for (let k = RULES.throwTiles; ; k++) {
+      const nc = c + (DX[d] ?? 0) * k;
+      const nr = r + (DY[d] ?? 0) * k;
+      if (!inBounds(nc, nr)) return;
+      const i = tileIndex(nc, nr);
+      if (isFloorLike(this.grid[i]) && !this.balloonAt(i)) {
+        b.fly = { t: 0, total: RULES.throwTime, fx: b.x, fy: b.y, tx: tileCenter(nc), ty: tileCenter(nr) };
+        b.move = null;
+        b.pass.clear();
+        this.fx.push({ k: 'throw', id: p.id, x: b.x, y: b.y });
+        return;
+      }
+    }
+  }
+
+  private landBalloon(b: Balloon): void {
+    const j = b.fly;
+    if (!j) return;
+    b.fly = null;
+    const dx = Math.sign(j.tx - j.fx);
+    const dy = Math.sign(j.ty - j.fy);
+    let c = tileOf(j.tx);
+    let r = tileOf(j.ty);
+    const taken = (i: number) => this.balloons.some((o) => o !== b && !o.fly && this.balloonTile(o) === i);
+    while (!isFloorLike(this.grid[tileIndex(c, r)]) || taken(tileIndex(c, r))) {
+      if (!inBounds(c + dx, r + dy) || (dx === 0 && dy === 0)) break;
+      c += dx;
+      r += dy;
+    }
+    b.x = tileCenter(c);
+    b.y = tileCenter(r);
+    const i = tileIndex(c, r);
+    for (const q of this.players) if (q.state !== DEAD && this.overlapsTile(q, i)) b.pass.add(q.id);
+  }
+
+  private updateBalloons(): void {
+    for (const b of this.balloons) {
+      if (b.fly) {
+        const j = b.fly;
+        j.t++;
+        const f = Math.min(1, j.t / j.total);
+        b.x = j.fx + (j.tx - j.fx) * f;
+        b.y = j.fy + (j.ty - j.fy) * f;
+        if (j.t >= j.total) this.landBalloon(b);
+        continue; // the fuse waits while the balloon is in the air
+      }
+      if (b.move) this.advanceBalloon(b);
+      else this.checkBelt(b);
+      if (!b.move || b.move.kind === 'belt') b.fuse--; // a kicked balloon's fuse waits until it stops
+      if (b.pass.size) {
+        const i = this.balloonTile(b);
+        for (const id of b.pass) {
+          const q = this.byId(id);
+          if (!q || q.state === DEAD || !this.overlapsTile(q, i)) b.pass.delete(id);
+        }
+      }
+    }
+  }
+
+  private advanceBalloon(b: Balloon): void {
+    const m = b.move;
+    if (!m) return;
+    const tx = tileCenter(m.to % COLS);
+    const ty = tileCenter(Math.floor(m.to / COLS));
+    if (Math.abs(tx - b.x) + Math.abs(ty - b.y) > m.speed) {
+      b.x += (DX[m.dir] ?? 0) * m.speed;
+      b.y += (DY[m.dir] ?? 0) * m.speed;
+      return;
+    }
+    b.x = tx;
+    b.y = ty;
+    const c = tileOf(tx);
+    const r = tileOf(ty);
+    if (m.kind === 'kick') {
+      const next = this.nextBalloonTile(b, c, r, m.dir);
+      if (next < 0) b.move = null;
+      else m.to = next;
+      return;
+    }
+    const belt = CONVEYOR[this.grid[m.to] ?? '#'];
+    if (!belt) {
+      b.move = null;
+      return;
+    }
+    m.dir = belt;
+    const next = this.nextBalloonTile(b, c, r, belt);
+    if (next < 0) b.move = null;
+    else m.to = next;
+  }
+
+  private checkBelt(b: Balloon): void {
+    const belt = CONVEYOR[this.grid[this.balloonTile(b)] ?? '#'];
+    if (!belt) return;
+    const next = this.nextBalloonTile(b, tileOf(b.x), tileOf(b.y), belt);
+    if (next >= 0) b.move = { dir: belt, speed: RULES.conveyorSpeed / TICK_RATE, kind: 'belt', to: next };
+  }
+
+  // ---------------------------------------------------------------- active items
+
+  private useActive(p: Player): void {
+    if (!p.active || p.activeN <= 0 || p.active === 'needle') return; // the needle only works while trapped
+    if (p.active === 'dart') {
+      this.darts.push({ owner: p.id, start: tileIndex(p.tc, p.tr), x: p.x, y: p.y, dir: p.face || 2 });
+      this.consume(p, 1);
+      this.fx.push({ k: 'dart', id: p.id });
+    } else if (p.active === 'banana') {
+      const i = tileIndex(p.tc, p.tr);
+      if (this.bananas[i] === null && isFloorLike(this.grid[i])) {
+        this.bananas[i] = p.side;
+        this.consume(p, 1);
+        this.fx.push({ k: 'banana', id: p.id });
+      }
+    } else if (p.active === 'spring') {
+      this.springJump(p);
+    }
+  }
+
+  private consume(p: Player, n: number): void {
+    p.activeN -= n;
+    if (p.activeN <= 0) {
+      p.active = null;
+      p.activeN = 0;
+    }
+  }
+
+  private useNeedle(p: Player): void {
+    p.state = ALIVE;
+    p.trapT = 0;
+    this.consume(p, 1);
+    // the stream lingers: a needle used too early gets you trapped again
+    for (const bl of this.blasts) bl.hit.delete(p.id);
+    this.fx.push({ k: 'needle', id: p.id });
+  }
+
+  private springJump(p: Player): void {
+    const d = p.face || 2;
+    for (let k = 1; k <= RULES.springMaxTiles; k++) {
+      const c = p.tc + (DX[d] ?? 0) * k;
+      const r = p.tr + (DY[d] ?? 0) * k;
+      if (!inBounds(c, r)) return;
+      const i = tileIndex(c, r);
+      if (!isFloorLike(this.grid[i]) || this.balloonAt(i)) continue;
+      if (p.activeN < k) return;
+      this.consume(p, k);
+      p.air = { t: 0, total: RULES.springTime, fx: p.x, fy: p.y, tx: tileCenter(c), ty: tileCenter(r) };
+      p.slide = 0;
+      p.slideIce = false;
+      this.fx.push({ k: 'jump', id: p.id });
+      return;
+    }
+  }
+
+  private updateDarts(): void {
+    const speed = RULES.dartSpeed / TICK_RATE;
+    this.darts = this.darts.filter((d) => {
+      for (let s = 0; s < speed; s += 5) {
+        const step = Math.min(5, speed - s);
+        d.x += (DX[d.dir] ?? 0) * step;
+        d.y += (DY[d.dir] ?? 0) * step;
+        const c = tileOf(d.x);
+        const r = tileOf(d.y);
+        if (!inBounds(c, r)) return false;
+        const i = tileIndex(c, r);
+        const t = this.grid[i];
+        if (t === '#' || t === 'x' || t === 'o') return false;
+        if (i === d.start) continue;
+        const b = this.balloonAt(i);
+        if (b) {
+          b.fuse = 0;
+          b.move = null;
+          return false;
+        }
+      }
+      return true;
+    });
+  }
+
+  // ---------------------------------------------------------------- explosions
+
+  private explode(): void {
+    const queue = this.balloons.filter((b) => b.fuse <= 0 && !b.fly);
+    if (!queue.length) return;
+    const done = new Set<Balloon>();
+    const breaks = new Map<number, Blast>();
+    while (queue.length) {
+      const b = queue.shift()!;
+      if (done.has(b)) continue;
+      done.add(b);
+      const c = tileOf(b.x);
+      const r = tileOf(b.y);
+      const blast: Blast = {
+        id: this.nextId++,
+        c,
+        r,
+        arms: [0, 0, 0, 0],
+        tiles: new Set([tileIndex(c, r)]),
+        t: RULES.streamLinger,
+        hit: new Set(),
+        reveal: [],
+      };
+      for (let d = 1; d <= 4; d++) {
+        for (let k = 1; k <= b.pow; k++) {
+          const cc = c + (DX[d] ?? 0) * k;
+          const rr = r + (DY[d] ?? 0) * k;
+          if (!inBounds(cc, rr)) break;
+          const i = tileIndex(cc, rr);
+          const t = this.grid[i];
+          if (t === '#') break;
+          blast.arms[d - 1] = k;
+          blast.tiles.add(i);
+          if (t === 'x' || t === 'o') {
+            if (!breaks.has(i)) breaks.set(i, blast);
+            break; // the stream stops at the first crate it breaks
+          }
+          for (const o of this.balloons) if (!done.has(o) && !o.fly && this.balloonTile(o) === i) queue.push(o);
+        }
+      }
+      this.blasts.push(blast);
+      this.fx.push({ k: 'boom', x: tileCenter(c), y: tileCenter(r), id: b.owner });
+    }
+    this.balloons = this.balloons.filter((b) => !done.has(b));
+    for (const [i, blast] of breaks) {
+      this.grid[i] = '.';
+      this.gridVersion++;
+      const item = this.rollDrop();
+      if (item) blast.reveal.push([i, item]);
+      this.fx.push({ k: 'break', x: tileCenter(i % COLS), y: tileCenter(Math.floor(i / COLS)) });
+    }
+  }
+
+  private rollDrop(): ItemType | null {
+    if (this.dropTotal <= 0 || this.rng.next() >= this.dropRate) return null;
+    let roll = this.rng.next() * this.dropTotal;
+    for (const [t, w] of this.dropTable) {
+      roll -= w;
+      if (roll < 0) return t;
+    }
+    return this.dropTable[this.dropTable.length - 1]?.[0] ?? null;
+  }
+
+  private updateBlasts(): void {
+    for (const bl of this.blasts) {
+      for (const i of bl.tiles) {
+        if (this.items[i]) {
+          this.items[i] = null; // streams wash away items lying on the floor
+          this.itemsVersion++;
+        }
+      }
+      for (const p of this.players) {
+        if (p.state !== ALIVE || p.air || bl.hit.has(p.id)) continue;
+        if (!bl.tiles.has(tileIndex(p.tc, p.tr))) continue;
+        bl.hit.add(p.id);
+        if (p.mount) {
+          p.mount = null;
+          p.dismountT = RULES.dismount;
+          p.slide = 0;
+          p.slideIce = false;
+          this.unstick(p);
+          this.fx.push({ k: 'dismount', id: p.id, x: p.x, y: p.y });
+        } else {
+          this.trap(p);
+        }
+      }
+      bl.t--;
+    }
+    if (!this.blasts.some((bl) => bl.t <= 0)) return;
+    const ended = this.blasts.filter((bl) => bl.t <= 0);
+    this.blasts = this.blasts.filter((bl) => bl.t > 0);
+    for (const bl of ended) {
+      for (const [i, item] of bl.reveal) {
+        if (this.items[i] || this.grid[i] !== '.') continue;
+        this.items[i] = item; // items under a crate appear once its stream is gone
+        this.itemsVersion++;
+      }
+    }
+  }
+
+  private trap(p: Player): void {
+    p.state = TRAPPED;
+    p.trapT = RULES.trapped;
+    p.curse = null;
+    p.curseT = 0;
+    p.cloakT = 0;
+    p.slide = 0;
+    p.slideIce = false;
+    p.pushT = 0;
+    p.stats.trapped++;
+    this.fx.push({ k: 'trap', id: p.id, x: p.x, y: p.y });
+  }
+
+  private updateTrapped(): void {
+    for (const p of this.players) {
+      if (p.state !== TRAPPED) continue;
+      if (--p.trapT <= 0) {
+        this.kill(p, null);
+        continue;
+      }
+      for (const q of this.players) {
+        if (q === p || q.state !== ALIVE || q.air) continue;
+        if (Math.abs(q.x - p.x) >= RULES.touch || Math.abs(q.y - p.y) >= RULES.touch) continue;
+        if (this.mode === 'team' && q.team === p.team) {
+          p.state = ALIVE;
+          p.trapT = 0;
+          q.stats.rescues++;
+          this.fx.push({ k: 'free', id: p.id, by: q.id, x: p.x, y: p.y });
+        } else {
+          this.kill(p, q);
+        }
+        break;
+      }
+    }
+  }
+
+  private kill(p: Player, by: Player | null): void {
+    if (p.state === DEAD) return;
+    p.state = DEAD;
+    p.trapT = 0;
+    p.mount = null;
+    p.slide = 0;
+    p.air = null;
+    p.curse = null;
+    p.cloakT = 0;
+    if (by) by.stats.kills++;
+    this.fx.push({ k: 'pop', id: p.id, by: by?.id, x: p.x, y: p.y });
+    const spots = this.rng.shuffle(this.emptyTiles());
+    for (const t of p.bag) {
+      const i = spots.pop();
+      if (i === undefined) break;
+      this.items[i] = t;
+    }
+    if (p.bag.length) this.itemsVersion++;
+    p.bag = [];
+  }
+
+  private checkEnd(): void {
+    const sides = new Set(this.players.filter((p) => p.state !== DEAD).map((p) => p.side));
+    const ko = this.initialSides >= 2 ? sides.size <= 1 : sides.size === 0;
+    if (!ko && this.timeLeft > 0) return;
+    this.phase = 'over';
+    const winner = ko && sides.size === 1 ? [...sides][0] : undefined;
+    this.result = {
+      draw: winner === undefined,
+      winners: winner === undefined ? [] : this.players.filter((p) => p.side === winner).map((p) => p.id),
+      reason: ko ? 'ko' : 'time',
+      stats: Object.fromEntries(this.players.map((p) => [p.id, { ...p.stats }])),
+    };
+    this.fx.push({ k: 'end' });
+  }
+
+  // ---------------------------------------------------------------- helpers
+
+  private isEmptyFloor(i: number): boolean {
+    return this.grid[i] === '.' && !this.items[i] && this.bananas[i] === null && !this.balloonAt(i);
+  }
+
+  private emptyTiles(): number[] {
+    const out: number[] = [];
+    for (let i = 0; i < TILE_COUNT; i++) if (this.isEmptyFloor(i)) out.push(i);
+    return out;
+  }
+
+  private bananaTiles(): number[] {
+    const out: number[] = [];
+    this.bananas.forEach((b, i) => {
+      if (b !== null) out.push(i);
+    });
+    return out;
+  }
+
+  private encodeItems(): string {
+    return this.items.map((t) => (t ? ITEMS[t].code : '.')).join('');
+  }
+}
