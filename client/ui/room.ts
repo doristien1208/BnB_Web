@@ -2,7 +2,7 @@ import { CHARACTERS } from '../../shared/characters';
 import { COLORS, TEAMS } from '../../shared/colors';
 import { MAX_PLAYERS, TIME_OPTIONS } from '../../shared/constants';
 import { MAPS } from '../../shared/maps';
-import { BOT_LEVELS, type BotLevel, type RoomMember, type RoomView } from '../../shared/protocol';
+import { BOT_LEVELS, RULE_NAMES, type BotLevel, type RoomMember, type RoomView } from '../../shared/protocol';
 import type { Audio } from '../audio';
 import { clear, h, isSubmitKey } from '../dom';
 import type { Net } from '../net';
@@ -365,6 +365,21 @@ export class RoomScreen {
     const cfg = view.config;
     clear(this.rules);
     this.rules.append(
+      h('label', null, '規則'),
+      segmented(
+        [
+          { value: 'survival' as const, label: RULE_NAMES.survival },
+          { value: 'deathmatch' as const, label: RULE_NAMES.deathmatch },
+        ],
+        cfg.rule,
+        host,
+        (rule) => this.net.send({ t: 'config', rule }),
+      ),
+      h(
+        'p',
+        { class: 'muted small' },
+        cfg.rule === 'deathmatch' ? '時間內擊殺最多者獲勝；死後 3 秒原地復活，無敵 1.5 秒' : '撐到最後的一方獲勝',
+      ),
       h('label', null, '模式'),
       segmented(
         [

@@ -20,7 +20,11 @@ export type Sfx =
   | 'siren'
   | 'thud'
   | 'chime'
-  | 'whoosh';
+  | 'whoosh'
+  | 'cannon'
+  | 'glitch'
+  | 'crash'
+  | 'respawn';
 
 const NOTE: Record<string, number> = { C: 0, 'C#': 1, D: 2, 'D#': 3, E: 4, F: 5, 'F#': 6, G: 7, 'G#': 8, A: 9, 'A#': 10, B: 11 };
 const freq = (n: string) => {
@@ -162,6 +166,21 @@ export class Audio {
       case 'whoosh':
         this.noise(t, 0.4, 600, 3000, 0.35);
         [0, 0.08, 0.16].forEach((d) => this.tone(t + d, 500, 900, 0.08, 'square', 0.12));
+        break;
+      case 'cannon':
+        this.noise(t, 0.2, 2500, 300, 0.6);
+        this.tone(t, 160, 60, 0.18, 'square', 0.4);
+        break;
+      case 'glitch':
+        [0, 0.05, 0.1, 0.17].forEach((d, k) => this.tone(t + d, k % 2 ? 180 : 95, k % 2 ? 140 : 80, 0.04, 'sawtooth', 0.14));
+        break;
+      case 'crash':
+        // a burst of static that stutters, over a low buzz
+        [0, 0.07, 0.12, 0.22, 0.27].forEach((d, k) => this.noise(t + d, 0.05, k % 2 ? 5000 : 2200, 1200, 0.45));
+        this.tone(t, 70, 55, 0.4, 'square', 0.18);
+        break;
+      case 'respawn':
+        [392, 523, 659, 784].forEach((f, k) => this.tone(t + k * 0.05, f, f * 1.02, 0.09, 'triangle', 0.25));
         break;
     }
   }

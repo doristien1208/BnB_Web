@@ -1,9 +1,11 @@
 import { CHARACTERS } from '../../shared/characters';
 import { VERSION } from '../../shared/constants';
+import type { Audio } from '../audio';
 import { h, isSubmitKey, store, toast } from '../dom';
-import { portrait } from './common';
+import { keysText, loadBindings } from '../keys';
+import { portrait, settingsModal } from './common';
 
-export function entryScreen(onEnter: (name: string) => void): HTMLElement {
+export function entryScreen(onEnter: (name: string) => void, audio: Audio): HTMLElement {
   const input = h('input', {
     class: 'input big',
     maxLength: 12,
@@ -21,6 +23,12 @@ export function entryScreen(onEnter: (name: string) => void): HTMLElement {
     onEnter(name);
   };
   input.addEventListener('keydown', (e) => isSubmitKey(e) && go());
+  const hint = h('p', { class: 'hint' });
+  const paintHint = () => {
+    const b = loadBindings();
+    hint.textContent = `方向鍵移動 · ${keysText(b, 'balloon')} 放水球 · ${keysText(b, 'item')} 用道具`;
+  };
+  paintHint();
   const colors = [0, 5, 3, 1, 6, 7];
   const el = h(
     'div',
@@ -33,7 +41,12 @@ export function entryScreen(onEnter: (name: string) => void): HTMLElement {
       h('div', { class: 'parade' }, ...CHARACTERS.map((c, k) => portrait(c.id, colors[k] ?? 0, 3))),
       input,
       h('button', { class: 'btn primary big', onclick: go }, '進入大廳'),
-      h('p', { class: 'hint' }, '方向鍵移動 · Space 放水球 · Ctrl / Z 用道具'),
+      hint,
+      h(
+        'div',
+        { class: 'entry-tools' },
+        h('button', { class: 'btn ghost small', onclick: () => settingsModal(audio, paintHint) }, '設定與按鍵'),
+      ),
       h('p', { class: 'hint small' }, `v${VERSION}`),
     ),
   );

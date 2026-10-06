@@ -1,7 +1,7 @@
 import type { ThemeKey } from '../../shared/maps';
 import { INK, WHITE, cached, sprite, type Px } from './art';
 
-type FloorStyle = 'grass' | 'plank' | 'snow' | 'plate' | 'sand' | 'candy' | 'dirt' | 'stone';
+type FloorStyle = 'grass' | 'plank' | 'snow' | 'plate' | 'sand' | 'candy' | 'dirt' | 'stone' | 'code';
 type HardStyle =
   | 'house'
   | 'tree'
@@ -13,8 +13,10 @@ type HardStyle =
   | 'tomb'
   | 'pillar'
   | 'brick'
-  | 'tank';
-type SoftStyle = 'crate' | 'snow' | 'gift' | 'pot' | 'box';
+  | 'tank'
+  | 'sandbag'
+  | 'bracket';
+type SoftStyle = 'crate' | 'snow' | 'gift' | 'pot' | 'box' | 'ammo' | 'bug';
 
 export interface Theme {
   floor: FloorStyle;
@@ -37,6 +39,8 @@ export interface Theme {
   /** colour around the field (side panel) */
   panel: string;
   music: number;
+  /** colours for the map card in the waiting room, where the theme's own would vanish on a dark floor */
+  preview?: { hard: string; soft: string };
 }
 
 const WOOD = { softMain: '#d9a066', softDark: '#8a5a2b', softLight: '#f0c58a', softAccent: '#f0c58a' };
@@ -119,6 +123,21 @@ export const THEMES: Record<ThemeKey, Theme> = {
     bush: '#3f9e4d', bushDark: '#246b30', bushLight: '#7fd36f',
     panel: '#2b4f6e', music: 2,
   },
+  field: {
+    floor: 'dirt', floorA: '#8a9a5b', floorB: '#839455', floorMark: '#6b7a43',
+    hard: 'sandbag', hardMain: '#c8b07a', hardDark: '#8c7444', hardLight: '#e0cc98', hardAccent: '#5b6b3a',
+    soft: 'ammo', softMain: '#6b7d3c', softDark: '#3f4a22', softLight: '#8fa356', softAccent: '#e8d36a',
+    bush: '#4e6b2f', bushDark: '#2f4419', bushLight: '#7d9a4c',
+    panel: '#3f4a22', music: 2,
+  },
+  code: {
+    floor: 'code', floorA: '#1e2230', floorB: '#212638', floorMark: '#2c3350',
+    hard: 'bracket', hardMain: '#2b3248', hardDark: '#141826', hardLight: '#3d4766', hardAccent: '#c792ea',
+    soft: 'bug', softMain: '#323a52', softDark: '#1a1f2e', softLight: '#4a5577', softAccent: '#ff6b6b',
+    bush: '#3f9e4d', bushDark: '#246b30', bushLight: '#7fd36f',
+    panel: '#141826', music: 1,
+    preview: { hard: '#c792ea', soft: '#ff6b6b' },
+  },
 };
 
 // ---------------------------------------------------------------- static tiles (20 x 20, blocks 20 x 24)
@@ -178,6 +197,10 @@ export function floorSprite(key: ThemeKey, alt: boolean, v: number): HTMLCanvasE
           p.rect(0, 19, 20, 1, m);
           p.rect(19, 0, 1, 20, m);
           if (v === 1) p.line(4, 6, 8, 9, m);
+          break;
+        case 'code':
+          // an editor's background: the code itself is drawn over it, sharp (client/game/code.ts)
+          p.rect(0, 0, 20, 1, m);
           break;
       }
     }),
@@ -316,6 +339,40 @@ const HARD: Record<HardStyle, (p: Px, t: Theme) => void> = {
     p.dot(13, 13, '#e53935');
     p.rect(3, 22, 14, 1, INK);
   },
+  sandbag: (p, t) => {
+    // three rows of sandbags, staggered like a brick wall
+    for (const [y, xs] of [
+      [17, [0, 10]],
+      [11, [5, -5, 15]],
+      [5, [0, 10]],
+    ] as const) {
+      for (const x of xs) {
+        p.ovalO(x + 5, y + 3, 5.5, 3.5, t.hardMain, INK);
+        p.oval(x + 4, y + 2, 3, 1.2, t.hardLight);
+        p.dot(x + 5, y + 5, t.hardDark);
+      }
+    }
+    p.rect(0, 23, 20, 1, INK);
+  },
+  bracket: (p, t) => {
+    p.rect(0, 3, 20, 20, INK);
+    p.rect(1, 4, 18, 18, t.hardMain);
+    p.rect(1, 4, 18, 3, t.hardLight);
+    p.rect(1, 20, 18, 2, t.hardDark);
+    // { } in the theme's keyword colour
+    const a = t.hardAccent;
+    p.rect(5, 9, 2, 1, a);
+    p.rect(4, 10, 1, 3, a);
+    p.rect(3, 13, 1, 1, a);
+    p.rect(4, 14, 1, 3, a);
+    p.rect(5, 17, 2, 1, a);
+    p.rect(13, 9, 2, 1, a);
+    p.rect(15, 10, 1, 3, a);
+    p.rect(16, 13, 1, 1, a);
+    p.rect(15, 14, 1, 3, a);
+    p.rect(13, 17, 2, 1, a);
+    p.rect(8, 13, 4, 1, '#82aaff');
+  },
 };
 
 export function softSprite(key: ThemeKey): HTMLCanvasElement {
@@ -376,6 +433,36 @@ const SOFT: Record<SoftStyle, (p: Px, t: Theme) => void> = {
     p.dot(9, 14, WHITE);
     p.rect(10, 19, 1, 2, INK);
     p.rect(2, 21, 16, 1, t.softDark);
+  },
+  ammo: (p, t) => {
+    p.rect(1, 5, 18, 18, INK);
+    p.rect(2, 6, 16, 16, t.softMain);
+    p.rect(2, 6, 16, 3, t.softLight);
+    p.rect(2, 13, 16, 1, t.softDark);
+    p.rect(4, 9, 1, 12, t.softDark);
+    p.rect(15, 9, 1, 12, t.softDark);
+    // stencilled star
+    p.rect(9, 15, 2, 5, t.softAccent);
+    p.rect(7, 17, 6, 1, t.softAccent);
+    p.dot(8, 19, t.softAccent);
+    p.dot(11, 19, t.softAccent);
+  },
+  bug: (p, t) => {
+    p.rect(1, 5, 18, 18, INK);
+    p.rect(2, 6, 16, 16, t.softMain);
+    p.rect(2, 6, 16, 2, t.softLight);
+    // a beetle: the bug waiting to be squashed
+    for (const y of [12, 15, 18]) {
+      p.line(5, y - 1, 8, y, t.softDark);
+      p.line(12, y, 15, y - 1, t.softDark);
+    }
+    p.ovalO(10, 15, 3.6, 4.6, t.softAccent, INK);
+    p.rect(10, 11, 1, 9, INK);
+    p.ovalO(10, 9.5, 2, 1.6, '#ffd1d1', INK);
+    p.dot(8, 7, INK);
+    p.dot(12, 7, INK);
+    p.dot(8, 14, '#ffd1d1');
+    p.dot(12, 17, '#ffd1d1');
   },
 };
 

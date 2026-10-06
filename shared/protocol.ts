@@ -1,6 +1,9 @@
 import type { Dir } from './types';
 
 export type Mode = 'ffa' | 'team';
+/** survival: the last side standing wins; deathmatch: the dead respawn and kills decide when time is up */
+export type Rule = 'survival' | 'deathmatch';
+export const RULE_NAMES: Readonly<Record<Rule, string>> = { survival: '生存', deathmatch: '死鬥' };
 export type TeamAssign = 'free' | 'random';
 export type RoomPhase = 'waiting' | 'playing' | 'results';
 /** Computer player difficulty: 0 easy, 1 normal, 2 hard. */
@@ -9,6 +12,7 @@ export const BOT_LEVELS = ['簡單', '普通', '困難'] as const;
 
 export interface PlayerStats {
   kills: number;
+  deaths: number;
   rescues: number;
   trapped: number;
   items: number;
@@ -35,8 +39,13 @@ export interface SnapPlayer {
   n: number; // active item count
   cu: string; // curse: 'r' reverse, 'a' auto-balloon
   cl: number; // cloak ticks left
-  iv: number; // invulnerable ticks left (after losing a mount)
+  iv: number; // invulnerable ticks left (after losing a mount, or after a respawn)
   dc: 0 | 1; // disconnected
+  rs: number; // deathmatch: ticks until a dead player respawns (0 = not coming back)
+  kl: number; // kills
+  dt: number; // deaths
+  ep: 0 | 1; // has the pirate eyepatch
+  cr: number; // 程式碼空間: ticks this player's screen stays crashed
 }
 
 export interface SnapBalloon {
@@ -87,6 +96,10 @@ export type FxKind =
   | 'supply' // supply drops are on their way
   | 'land' // a supply drop landed
   | 'spit' // the balloon machine fired
+  | 'respawn' // deathmatch: a player came back
+  | 'fire' // a tank fired a balloon
+  | 'glitch' // code regions started throwing an error
+  | 'crash' // an error caught a player (id): their screen crashes for a moment
   | 'end';
 
 export interface Fx {
@@ -112,6 +125,7 @@ export interface Snapshot {
   zt: number; // ticks until the next ring closes (-1 = no more)
   dr: [number, string, number][]; // supply drops in the air: tile, item code, ticks until they land
   mc?: number; // balloon machine: ticks until it fires (maps with a machine only)
+  ce?: [number, number][]; // code regions throwing an error: region index, ticks left (code map only)
   g?: string; // tile grid, sent when it changed
   i?: string; // floor items, sent when they changed
   fx: Fx[];
@@ -130,6 +144,7 @@ export interface GamePlayerInfo {
 export interface GameStartInfo {
   map: number;
   mode: Mode;
+  rule: Rule;
   time: number;
   players: GamePlayerInfo[];
 }
@@ -146,6 +161,7 @@ export interface RoomSummary {
   name: string;
   host: string;
   map: number;
+  rule: Rule;
   players: number; // computer players included
   bots: number;
   phase: RoomPhase;
@@ -169,6 +185,7 @@ export interface RoomMember {
 export interface RoomConfig {
   map: number; // -1 = random
   mode: Mode;
+  rule: Rule;
   assign: TeamAssign;
   time: number; // seconds
 }
@@ -191,7 +208,7 @@ export type C2S =
   | { t: 'pick'; char?: number; color?: number; team?: number }
   | { t: 'ready'; ready: boolean }
   | { t: 'chat'; text: string }
-  | { t: 'config'; map?: number; mode?: Mode; assign?: TeamAssign; time?: number }
+  | { t: 'config'; map?: number; mode?: Mode; rule?: Rule; assign?: TeamAssign; time?: number }
   | { t: 'kick'; id: string } // also removes a computer player
   | { t: 'addBot'; level: BotLevel }
   | { t: 'setBot'; id: string; char?: number; color?: number; team?: number; level?: BotLevel }

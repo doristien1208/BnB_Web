@@ -127,4 +127,4 @@ try {
 const savedName = store.get('bnb.name');
 if (new URLSearchParams(location.search).has('sandbox')) startSandbox(app, audio);
 else if (resumable && savedName) enter(savedName);
-else show(entryScreen(enter));
+else show(entryScreen(enter, audio));

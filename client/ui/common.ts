@@ -5,6 +5,7 @@ import type { Audio } from '../audio';
 import { h, isSubmitKey } from '../dom';
 import { characterSprite } from '../game/art';
 import { THEMES } from '../game/themes';
+import { keyEditor } from './keys';
 
 export function portrait(char: number, color: number, scale = 2): HTMLCanvasElement {
   const ch = CHARACTERS[char] ?? CHARACTERS[0]!;
@@ -41,8 +42,8 @@ export function mapPreview(id: number): HTMLImageElement {
     } else {
       const t = THEMES[map.key];
       const color: Record<string, string> = {
-        '#': t.hardDark,
-        x: t.softMain,
+        '#': t.preview?.hard ?? t.hardDark,
+        x: t.preview?.soft ?? t.softMain,
         '*': t.bush,
         o: '#a1693c',
         '~': '#3a8ee0',
@@ -126,7 +127,8 @@ export function modal(
   inputs[0]?.focus();
 }
 
-export function settingsModal(audio: Audio): void {
+/** Sound switches and the key settings; `onClose` runs when the dialog goes (e.g. to refresh key hints). */
+export function settingsModal(audio: Audio, onClose?: () => void): void {
   const sfx = h('button', { class: 'btn' });
   const music = h('button', { class: 'btn' });
   const paint = () => {
@@ -142,27 +144,22 @@ export function settingsModal(audio: Audio): void {
     paint();
   };
   paint();
+  const close = () => {
+    back.remove();
+    onClose?.();
+  };
   const back = h(
     'div',
-    { class: 'modal-back', onclick: (e: Event) => e.target === back && back.remove() },
+    { class: 'modal-back', onclick: (e: Event) => e.target === back && close() },
     h(
       'div',
-      { class: 'modal' },
+      { class: 'modal wide' },
       h('h3', null, '設定'),
       h('div', { class: 'row' }, sfx, music),
       h('h4', null, '按鍵'),
-      h(
-        'table',
-        { class: 'keys' },
-        h('tbody', null, [
-          h('tr', null, h('td', null, '移動'), h('td', null, '方向鍵'), h('td', null, 'W A S D')),
-          h('tr', null, h('td', null, '放水球'), h('td', null, 'Space'), h('td', null, 'J')),
-          h('tr', null, h('td', null, '使用道具'), h('td', null, 'Ctrl 或 Z'), h('td', null, 'K')),
-          h('tr', null, h('td', null, '聊天 / 靜音'), h('td', null, 'Enter / M'), h('td', null, '')),
-        ]),
-      ),
-      h('p', { class: 'muted small' }, '兩組按鍵同時有效。Mac 的 Ctrl + 方向鍵會切換桌面，請用 Z 放道具。'),
-      h('div', { class: 'row end' }, h('button', { class: 'btn primary', onclick: () => back.remove() }, '完成')),
+      keyEditor(),
+      h('p', { class: 'muted small' }, '同一個動作的鍵都有效。Mac 的 Ctrl + 方向鍵會切換桌面，Mac 玩家可改用 Z 放道具。'),
+      h('div', { class: 'row end' }, h('button', { class: 'btn primary', onclick: close }, '完成')),
     ),
   );
   document.body.append(back);

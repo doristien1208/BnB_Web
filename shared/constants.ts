@@ -1,5 +1,5 @@
 /** Shown on the entry screen and in /healthz, so a deployment can be checked at a glance. */
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 export const TILE = 40;
 export const COLS = 15;
@@ -58,6 +58,22 @@ export const RULES = {
   machineMin: 4,
   machineMax: 8,
   machinePow: 2,
+  // deathmatch: the dead come back where they fell, then nothing can trap them for a moment
+  respawn: sec(3),
+  respawnInvuln: sec(1.5),
+  // the tank of 野戰前線: fires balloons forward like a kick and holds this many more of them
+  tankExtra: 2,
+  // 程式碼空間: from codeStart, every codeEveryMin–codeEveryMax 1–2 regions throw an error for codeError, with
+  // no warning; anyone standing on an error moves at codeSlow of their speed, and the first time an error
+  // catches a player their screen crashes (covered by glitches) for codeCrash
+  codeStart: sec(10),
+  codeEveryMin: sec(6),
+  codeEveryMax: sec(10),
+  codeError: sec(3),
+  codeSlow: 0.3,
+  codeCrash: sec(1.2),
+  // the pirate eyepatch: turtles and owls run this many speed levels faster
+  eyepatchBonus: 2,
 } as const;
 
 /** Movement speed in px/s for speed level 1–10 (turtle = 1, UFO = 10). */

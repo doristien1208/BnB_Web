@@ -1,9 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import { RULES, TILE, TICK_RATE } from '../shared/constants';
-import { SUPPLY_ITEMS } from '../shared/items';
+import { ITEMS, SUPPLY_ITEMS } from '../shared/items';
 import { MAPS, type MapDef } from '../shared/maps';
-import type { GamePlayerInfo, Mode } from '../shared/protocol';
-import { ALIVE, DEAD, Game, TRAPPED, ringOf, tileCenter, tileIndex, type Player } from '../shared/sim/game';
+import type { GamePlayerInfo, Mode, Rule } from '../shared/protocol';
+import {
+  ALIVE,
+  DEAD,
+  Game,
+  TRAPPED,
+  moveLevel,
+  ringOf,
+  tileCenter,
+  tileIndex,
+  type Balloon,
+  type Player,
+} from '../shared/sim/game';
 import type { Dir } from '../shared/types';
 
 const OPEN = [
@@ -23,7 +34,9 @@ function withTiles(edits: [number, number, string][]): string[] {
   return rows.map((r) => r.join(''));
 }
 
-function makeGame(opts: { rows?: string[]; n?: number; mode?: Mode; teams?: number[] } = {}): Game {
+function makeGame(
+  opts: { rows?: string[]; n?: number; mode?: Mode; teams?: number[]; rule?: Rule; map?: MapDef } = {},
+): Game {
   const n = opts.n ?? 2;
   const infos: GamePlayerInfo[] = Array.from({ length: n }, (_, k) => ({
     id: 'abcd'[k]!,
@@ -33,7 +46,7 @@ function makeGame(opts: { rows?: string[]; n?: number; mode?: Mode; teams?: numb
     team: opts.teams?.[k] ?? -1,
     slot: k,
   }));
-  const g = new Game(mapOf(opts.rows), infos, { mode: opts.mode ?? 'ffa', time: 180, seed: 7 });
+  const g = new Game(opts.map ?? mapOf(opts.rows), infos, { mode: opts.mode ?? 'ffa', rule: opts.rule, time: 180, seed: 7 });
   g.countdown = 1;
   g.step(); // countdown over
   return g;
@@ -666,5 +679,324 @@ describe('every map', () => {
       }
     }
     expect(g.phase).toBe('over');
+  });
+});
+
+describe('deathmatch', () => {
+  /** a's balloon at (5,5) traps b at (6,5); returns once b is in the bubble */
+  function trapB(opts: { mode?: Mode; teams?: number[]; n?: number } = {}) {
+    const g = makeGame({ rule: 'deathmatch', ...opts });
+    const [a, b] = [P(g, 'a'), P(g, 'b')];
+    put(a, 5, 5);
+    g.pushAction('a', 'b');
+    g.step();
+    put(a, 0, 12);
+    put(b, 6, 5);
+    for (const p of g.players.slice(2)) put(p, 14, 12);
+    run(g, RULES.fuse);
+    expect(b.state).toBe(TRAPPED);
+    return g;
+  }
+
+  /** a balloon of `owner` that goes off on the next step */
+  function bomb(g: Game, owner: string, c: number, r: number): void {
+    const b: Balloon = { id: 900 + g.balloons.length, owner, x: tileCenter(c), y: tileCenter(r), fuse: 1, pow: 1, pass: new Set(), move: null, fly: null };
+    g.balloons.push(b);
+  }
+
+  it('brings a popped player back where they fell after 3 seconds, untouchable for 1.5', () => {
+    const g = trapB();
+    const [a, b] = [P(g, 'a'), P(g, 'b')];
+    run(g, RULES.streamLinger);
+    put(a, 6, 5);
+    a.y -= 20;
+    g.step();
+    expect(b.state).toBe(DEAD);
+    expect([a.stats.kills, b.stats.deaths]).toEqual([1, 1]);
+    put(a, 0, 12);
+    run(g, RULES.respawn - 2);
+    expect(b.state).toBe(DEAD);
+    expect(g.snapshot().p.find((p) => p.i === 'b')?.rs).toBeGreaterThan(0);
+    run(g, 2);
+    expect(b.state).toBe(ALIVE);
+    expect([b.tc, b.tr]).toEqual([6, 5]);
+    expect(b.invulnT).toBeGreaterThan(RULES.respawnInvuln - 3);
+    expect(g.phase).toBe('play');
+    // a stream right away passes through; once the 1.5 seconds are over it traps again
+    bomb(g, 'a', 6, 4);
+    run(g, 2);
+    expect(b.state).toBe(ALIVE);
+    run(g, RULES.respawnInvuln);
+    bomb(g, 'a', 6, 4);
+    run(g, 2);
+    expect(b.state).toBe(TRAPPED);
+  });
+
+  it('credits a burst bubble to whoever trapped the player, never to yourself', () => {
+    const g = trapB();
+    const [a, b] = [P(g, 'a'), P(g, 'b')];
+    run(g, RULES.trapped);
+    expect(b.state).toBe(DEAD);
+    expect(a.stats.kills).toBe(1);
+    // a traps themselves: a death, nobody's kill
+    put(a, 9, 9);
+    g.pushAction('a', 'b');
+    run(g, RULES.fuse + RULES.trapped + 2);
+    expect(a.stats.deaths).toBe(1);
+    expect([a.stats.kills, b.stats.kills]).toEqual([1, 0]);
+  });
+
+  it('respawns with the starting stats and scatters what was collected', () => {
+    const g = trapB();
+    const b = P(g, 'b');
+    b.bal = 3;
+    b.kick = true;
+    b.bag = ['bubble', 'bubble', 'shoe'];
+    run(g, RULES.trapped);
+    expect(g.items.filter((t) => t !== null)).toHaveLength(3);
+    run(g, RULES.respawn);
+    expect(b.state).toBe(ALIVE);
+    expect([b.bal, b.kick, b.bag.length]).toEqual([b.base.bal, false, 0]);
+  });
+
+  it('respawns on the nearest free floor when a balloon sits where they fell', () => {
+    const g = trapB();
+    const [a, b] = [P(g, 'a'), P(g, 'b')];
+    run(g, RULES.trapped);
+    put(a, 6, 5);
+    g.pushAction('a', 'b');
+    g.step();
+    put(a, 0, 12);
+    run(g, RULES.respawn);
+    expect(b.state).toBe(ALIVE);
+    expect(Math.abs(b.tc - 6) + Math.abs(b.tr - 5)).toBe(1);
+  });
+
+  it('is decided at the bell by kills, then by fewer deaths, else a draw', () => {
+    const at = (ka: number, da: number, kb: number, db: number) => {
+      const g = makeGame({ rule: 'deathmatch' });
+      Object.assign(P(g, 'a').stats, { kills: ka, deaths: da });
+      Object.assign(P(g, 'b').stats, { kills: kb, deaths: db });
+      g.timeLeft = 1;
+      g.step();
+      return g.result;
+    };
+    expect(at(2, 3, 1, 0)).toMatchObject({ winners: ['a'], reason: 'time' });
+    expect(at(1, 2, 1, 1)).toMatchObject({ winners: ['b'] });
+    expect(at(1, 1, 1, 1)?.draw).toBe(true);
+  });
+
+  it('adds up team kills', () => {
+    const g = makeGame({ rule: 'deathmatch', mode: 'team', teams: [0, 1, 1], n: 3 });
+    Object.assign(P(g, 'a').stats, { kills: 2, deaths: 1 });
+    Object.assign(P(g, 'b').stats, { kills: 1, deaths: 0 });
+    Object.assign(P(g, 'c').stats, { kills: 1, deaths: 0 });
+    g.timeLeft = 1;
+    g.step();
+    expect(g.result?.winners.sort()).toEqual(['b', 'c']); // 2 kills each side, fewer deaths
+  });
+
+  it('only ends early when everyone else has left', () => {
+    const g = trapB();
+    run(g, RULES.trapped);
+    expect(g.phase).toBe('play'); // b is down but coming back
+    g.forfeit('b');
+    run(g, RULES.respawn + 1);
+    expect(P(g, 'b').state).toBe(DEAD);
+    expect(g.result).toMatchObject({ winners: ['a'], reason: 'ko' });
+  });
+});
+
+describe('tank', () => {
+  it('fires balloons forward like a kick and holds two more than its rider', () => {
+    const g = makeGame();
+    const a = P(g, 'a');
+    put(P(g, 'b'), 0, 12);
+    put(a, 3, 5);
+    a.mount = 'tank';
+    a.face = 4;
+    for (let k = 0; k < 4; k++) {
+      g.pushAction('a', 'b');
+      run(g, 20); // the balloon has slid on, the tile in front is free again
+    }
+    run(g, 40);
+    expect(g.balloons).toHaveLength(a.bal + RULES.tankExtra);
+    expect(g.balloons.map((b) => tileIndex(Math.floor(b.x / TILE), Math.floor(b.y / TILE))).sort((x, y) => x - y)).toEqual([
+      tileIndex(12, 5),
+      tileIndex(13, 5),
+      tileIndex(14, 5),
+    ]);
+    expect(moveLevel(a)).toBe(4);
+  });
+
+  it('puts the balloon down under the tank when the tile in front is taken', () => {
+    const g = makeGame({ rows: withTiles([[6, 5, '#']]) });
+    const a = P(g, 'a');
+    put(a, 5, 5);
+    a.mount = 'tank';
+    a.face = 4;
+    g.pushAction('a', 'b');
+    g.step();
+    expect(g.balloons).toHaveLength(1);
+    expect([g.balloons[0]!.x, g.balloons[0]!.y]).toEqual([tileCenter(5), tileCenter(5)]);
+  });
+
+  it('waits on 野戰前線 from the start, two of them', () => {
+    const map = MAPS.find((m) => m.key === 'field')!;
+    const g = makeGame({ map });
+    expect(g.items[tileIndex(4, 6)]).toBe('tank');
+    expect(g.items[tileIndex(10, 6)]).toBe('tank');
+  });
+});
+
+describe('code regions', () => {
+  const REGIONS: MapDef = {
+    ...mapOf(),
+    regions: Array.from({ length: 13 }, () => 'aaaaaaa.bbbbbbb'),
+  };
+
+  /** a game on REGIONS with no scheduled errors: each test sets its own */
+  function quiet(rule?: Rule): Game {
+    const g = makeGame({ map: REGIONS, rule });
+    g.errorT = 1e6;
+    return g;
+  }
+
+  it('throw an error for three seconds without any warning, every few seconds', () => {
+    const g = makeGame({ map: MAPS.find((m) => m.key === 'code')! });
+    expect(g.regionCount).toBe(6);
+    expect(g.regionOf[tileIndex(7, 3)]).toBe(-1); // the gutters never error
+    run(g, RULES.codeStart - 1);
+    expect(g.errors).toHaveLength(0);
+    g.step();
+    expect(g.errors.length).toBeGreaterThanOrEqual(1);
+    expect(g.errors.length).toBeLessThanOrEqual(2);
+    expect(g.errors.every((e) => e.t === RULES.codeError)).toBe(true); // in force at once
+    const s = g.snapshot();
+    expect(s.ce?.[0]).toEqual([g.errors[0]!.region, RULES.codeError]);
+    expect(s.fx.some((f) => f.k === 'glitch')).toBe(true);
+    run(g, RULES.codeError);
+    expect(g.errors).toHaveLength(0);
+    let again = false;
+    for (let k = 0; k < RULES.codeEveryMax && !again; k++) {
+      g.step();
+      again = g.errors.length > 0;
+    }
+    expect(again).toBe(true);
+  });
+
+  it('slows down whoever stands on an error, but not a UFO', () => {
+    const g = quiet();
+    const [a, b] = [P(g, 'a'), P(g, 'b')];
+    g.errors = [{ id: 1, region: 0, t: 1e6 }];
+    put(a, 2, 5); // region a
+    put(b, 10, 5); // region b, no error
+    a.spd = b.spd = 5;
+    g.setInput('a', 2, 0);
+    g.setInput('b', 2, 0);
+    run(g, 10);
+    const slow = a.y - tileCenter(5);
+    const fast = b.y - tileCenter(5);
+    expect(slow / fast).toBeCloseTo(RULES.codeSlow, 1);
+    a.mount = 'ufo';
+    b.mount = 'ufo';
+    put(a, 2, 5);
+    put(b, 10, 5);
+    run(g, 10);
+    expect(a.y - tileCenter(5)).toBeCloseTo(b.y - tileCenter(5), 1);
+  });
+
+  it('crash the screen of whoever an error catches, once per error, but not a UFO', () => {
+    const g = quiet();
+    const [a, b] = [P(g, 'a'), P(g, 'b')];
+    put(a, 2, 5); // region a
+    put(b, 10, 5); // region b
+    g.errors = [{ id: 1, region: 0, t: 1e6 }]; // starts under a's feet
+    g.step();
+    expect([a.crashT, b.crashT]).toEqual([RULES.codeCrash, 0]);
+    const s = g.snapshot();
+    expect(s.p.find((p) => p.i === 'a')?.cr).toBe(RULES.codeCrash);
+    expect(s.fx.filter((f) => f.k === 'crash').map((f) => f.id)).toEqual(['a']);
+    run(g, RULES.codeCrash);
+    expect(a.crashT).toBe(0); // still on the same error: once is enough
+    put(a, 7, 5); // out onto the gutter and back in
+    g.step();
+    put(a, 2, 5);
+    g.step();
+    expect(a.crashT).toBe(0);
+    g.errors = [{ id: 2, region: 0, t: 1e6 }]; // the next error catches a again
+    g.step();
+    expect(a.crashT).toBe(RULES.codeCrash);
+    b.mount = 'ufo';
+    g.errors.push({ id: 3, region: 1, t: 1e6 });
+    g.step();
+    expect(b.crashT).toBe(0);
+  });
+
+  it('never brings a deathmatch player back on an error', () => {
+    const g = quiet('deathmatch');
+    const b = P(g, 'b');
+    put(P(g, 'a'), 14, 12);
+    put(b, 6, 5); // region a, next to the gutter
+    b.state = TRAPPED;
+    b.trapT = 1;
+    g.step();
+    expect(b.state).toBe(DEAD);
+    g.errors = [{ id: 1, region: 0, t: 1e6 }];
+    run(g, RULES.respawn);
+    expect(b.state).toBe(ALIVE);
+    expect([b.tc, b.tr]).toEqual([7, 5]);
+    expect(b.crashT).toBe(0);
+  });
+});
+
+describe('pirate eyepatch', () => {
+  it('speeds up turtles and owls by two, nothing else', () => {
+    const g = makeGame();
+    const a = P(g, 'a');
+    const level = (m: Player['mount'], patch: boolean) => {
+      a.mount = m;
+      a.eyepatch = patch;
+      return moveLevel(a);
+    };
+    expect([level('turtle', false), level('turtle', true)]).toEqual([1, 1 + RULES.eyepatchBonus]);
+    expect([level('owl', false), level('owl', true)]).toEqual([5, 5 + RULES.eyepatchBonus]);
+    expect([level('pirateTurtle', true), level('ufo', true), level('tank', true)]).toEqual([9, 10, 4]);
+    expect(level(null, true)).toBe(a.spd);
+  });
+
+  it('is picked up once and only drops on 海盜港灣', () => {
+    const g = makeGame();
+    const a = P(g, 'a');
+    put(a, 5, 5);
+    g.items[tileIndex(5, 5)] = 'eyepatch';
+    g.items[tileIndex(6, 5)] = 'eyepatch';
+    g.setInput('a', 4, 0);
+    run(g, 20);
+    expect(a.eyepatch).toBe(true);
+    expect(a.bag.filter((t) => t === 'eyepatch')).toHaveLength(1);
+    expect(ITEMS.eyepatch.weight).toBe(0);
+    expect(MAPS.filter((m) => (m.weights?.eyepatch ?? 0) > 0).map((m) => m.key)).toEqual(['pirate']);
+  });
+});
+
+describe('every map in deathmatch', () => {
+  it.each(MAPS.map((m) => [m.name, m] as const))('%s keeps respawning players through a round', (_n, map) => {
+    const infos: GamePlayerInfo[] = [0, 1, 2, 3].map((k) => ({ id: `p${k}`, name: `P${k}`, char: k, color: k, team: -1, slot: k }));
+    const g = new Game(map, infos, { mode: 'ffa', rule: 'deathmatch', time: 120, seed: map.id + 9 });
+    let seed = 3;
+    const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    let respawns = 0;
+    for (let t = 0; t < 60 * 130 && g.phase !== 'over'; t++) {
+      for (const p of infos) {
+        if (rand() < 0.05) g.setInput(p.id, Math.floor(rand() * 5) as Dir, Math.floor(rand() * 5) as Dir);
+        if (rand() < 0.03) g.pushAction(p.id, 'b');
+      }
+      g.step();
+      respawns += g.snapshot().fx.filter((f) => f.k === 'respawn').length;
+    }
+    expect(g.phase).toBe('over');
+    expect(g.result?.reason).toBe('time');
+    expect(respawns).toBeGreaterThan(0);
   });
 });

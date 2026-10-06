@@ -17,9 +17,11 @@ export type ItemType =
   | 'dart'
   | 'spring'
   | 'banana'
-  | 'iceSkate';
+  | 'iceSkate'
+  | 'tank'
+  | 'eyepatch';
 
-export type MountType = 'turtle' | 'owl' | 'pirateTurtle' | 'ufo';
+export type MountType = 'turtle' | 'owl' | 'pirateTurtle' | 'ufo' | 'tank';
 export type ActiveType = 'needle' | 'dart' | 'spring' | 'banana';
 export type ItemKind = 'stat' | 'curse' | 'special' | 'mount' | 'active';
 
@@ -54,6 +56,8 @@ export const ITEMS: Readonly<Record<ItemType, ItemDef>> = {
   spring: { type: 'spring', code: 'S', name: '彈簧鞋', kind: 'active', desc: '跳過面前障礙，每格用 1 次（3 次）', weight: 2 },
   banana: { type: 'banana', code: 'B', name: '香蕉皮', kind: 'active', desc: '放在地上讓對手滑走', weight: 2 },
   iceSkate: { type: 'iceSkate', code: 'i', name: '冰刀', kind: 'stat', desc: '速度直接升到上限（只在冰雪湖畔）', weight: 0 },
+  tank: { type: 'tank', code: 'K', name: '戰車', kind: 'mount', desc: '坐騎，速度 4，放水球鍵往前射出水球，水球 +2（只在野戰前線）', weight: 0 },
+  eyepatch: { type: 'eyepatch', code: 'E', name: '海盜眼罩', kind: 'stat', desc: '騎烏龜、貓頭鷹時速度 +2（只在海盜港灣）', weight: 0 },
 };
 
 export const ITEM_TYPES = Object.keys(ITEMS) as ItemType[];
@@ -65,10 +69,16 @@ export const ITEM_BY_CODE: Readonly<Record<string, ItemType>> = Object.fromEntri
   ITEM_TYPES.map((t) => [ITEMS[t].code, t]),
 );
 
-export const MOUNT_SPEED: Readonly<Record<MountType, number>> = { turtle: 1, owl: 5, pirateTurtle: 9, ufo: 10 };
+export const MOUNT_SPEED: Readonly<Record<MountType, number>> = { turtle: 1, owl: 5, pirateTurtle: 9, ufo: 10, tank: 4 };
 
-export const MOUNT_CODE: Readonly<Record<MountType, string>> = { turtle: 't', owl: 'o', pirateTurtle: 'T', ufo: 'f' };
-export const MOUNT_BY_CODE: Readonly<Record<string, MountType>> = { t: 'turtle', o: 'owl', T: 'pirateTurtle', f: 'ufo' };
+export const MOUNT_CODE: Readonly<Record<MountType, string>> = { turtle: 't', owl: 'o', pirateTurtle: 'T', ufo: 'f', tank: 'K' };
+export const MOUNT_BY_CODE: Readonly<Record<string, MountType>> = {
+  t: 'turtle',
+  o: 'owl',
+  T: 'pirateTurtle',
+  f: 'ufo',
+  K: 'tank',
+};
 
 export const isMount = (t: ItemType): t is MountType => ITEMS[t].kind === 'mount';
 export const isActive = (t: ItemType): t is ActiveType => ITEMS[t].kind === 'active';

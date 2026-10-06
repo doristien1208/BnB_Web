@@ -62,7 +62,12 @@ export class LobbyScreen {
           h('span', { class: 'room-no' }, `#${r.id}`),
           h('span', { class: 'room-name grow' }, r.name, r.locked ? h('span', { class: 'badge' }, '密碼') : null),
           h('span', { class: 'muted' }, `房主 ${r.host}`),
-          h('span', null, r.map >= 0 ? (MAPS[r.map]?.name ?? '') : '隨機地圖'),
+          h(
+            'span',
+            null,
+            r.map >= 0 ? (MAPS[r.map]?.name ?? '') : '隨機地圖',
+            r.rule === 'deathmatch' ? h('span', { class: 'badge' }, '死鬥') : null,
+          ),
           h('span', { class: 'count' }, `${r.players}/4`, r.bots ? h('span', { class: 'muted small' }, ` 含電腦 ${r.bots}`) : null),
           h('span', { class: `phase ${r.phase}` }, PHASE[r.phase]),
           h('button', { class: 'btn small', disabled: !open, onclick: () => this.join(r) }, '加入'),

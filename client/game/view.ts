@@ -5,20 +5,24 @@ import { ITEMS, ITEM_BY_CODE, MOUNT_BY_CODE } from '../../shared/items';
 import { MAPS } from '../../shared/maps';
 import {
   BOT_LEVELS,
+  RULE_NAMES,
   type C2S,
   type Fx,
   type GamePlayerInfo,
   type GameResult,
   type GameStartInfo,
+  type PlayerStats,
   type SnapBalloon,
   type SnapBlast,
   type SnapPlayer,
   type Snapshot,
 } from '../../shared/protocol';
-import { ringOf } from '../../shared/sim/game';
+import { codeRegions, ringOf } from '../../shared/sim/game';
 import type { Audio } from '../audio';
 import { h, isSubmitKey } from '../dom';
-import { balloonSprite, bananaSprite, characterSprite, itemSprite, mountSprite } from './art';
+import { isKey, keysText } from '../keys';
+import { balloonSprite, bananaSprite, characterSprite, itemSprite, mountSprite, tankSprite } from './art';
+import { CodeFloor, crashRelease, drawCrash } from './code';
 import { Input } from './input';
 import { Playback } from './playback';
 import {
@@ -39,6 +43,7 @@ import {
 } from './themes';
 
 export const FONT = '"PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif';
+const NO_STATS: PlayerStats = { kills: 0, deaths: 0, rescues: 0, trapped: 0, items: 0 };
 const WORLD_EXTRA = 1.5; // everything else is drawn this much further back: smoother, and nobody notices
 const MAX_EXTRAPOLATE = 2; // ticks motion carries on past the newest snapshot while the next one is late
 const BELT: Record<string, number> = { '^': 1, v: 2, '<': 3, '>': 4 };
@@ -87,6 +92,16 @@ export class GameView {
   private readonly chatBox: HTMLInputElement;
   private readonly clock = new Playback();
   private readonly machine: { x: number; y: number } | null = null;
+  /** 程式碼空間: tiles of each code region, the region of each tile (-1 = none), and the code drawn on them */
+  private readonly regionTiles: number[][] = [];
+  private readonly regionOf: Int8Array;
+  private readonly code: CodeFloor | null;
+  /** regions that were throwing an error in the last frame: when one stops, it loads new code */
+  private erroring = new Set<number>();
+  /** my crashed screen: when each tile clears, and the message it shows */
+  private crash: { release: Float32Array; message: string } | null = null;
+  private crashLeft = 0;
+  private readonly deathmatch: boolean;
   private snaps: Snapshot[] = [];
   private pending: { k: number; f: Fx }[] = [];
   private grid = '';
@@ -125,6 +140,12 @@ export class GameView {
       const avg = (k: 0 | 1) => machine.reduce((s, m) => s + m[k], 0) / machine.length;
       this.machine = { x: avg(0) * TILE + TILE / 2, y: avg(1) * TILE + TILE / 2 };
     }
+    const regions = codeRegions(map);
+    for (let k = 0; k < regions.count; k++) this.regionTiles.push([]);
+    regions.of.forEach((k, i) => k >= 0 && this.regionTiles[k]?.push(i));
+    this.regionOf = regions.of;
+    this.code = regions.count ? new CodeFloor(this.regionTiles) : null;
+    this.deathmatch = info.rule === 'deathmatch';
 
     this.canvas = h('canvas', { class: 'game-canvas' });
     this.ctx = this.canvas.getContext('2d')!;
@@ -206,24 +227,28 @@ export class GameView {
   // ---------------------------------------------------------------- events
 
   private readonly onKey = (e: KeyboardEvent): void => {
-    if (e.code === 'Enter') {
-      if (document.activeElement === this.chatBox) {
+    if (document.activeElement === this.chatBox) {
+      // typing: Enter sends whatever key opened the box, Esc closes it
+      if (e.code === 'Enter' || e.code === 'NumpadEnter') {
         if (!isSubmitKey(e)) return; // Enter that confirms a Chinese IME composition
         e.preventDefault();
         const text = this.chatBox.value.trim();
         if (text) this.net.send({ t: 'chat', text });
         this.closeChat();
-      } else {
-        e.preventDefault();
-        this.input.reset();
-        this.input.enabled = false;
-        this.chatBox.value = '';
-        this.chatBox.classList.add('open');
-        this.chatBox.focus();
+      } else if (e.code === 'Escape') {
+        this.closeChat();
       }
-    } else if (e.code === 'Escape' && document.activeElement === this.chatBox) {
-      this.closeChat();
-    } else if (e.code === 'KeyM' && document.activeElement !== this.chatBox) {
+      return;
+    }
+    const keys = this.input.keys;
+    if (isKey(keys, 'chat', e.code)) {
+      e.preventDefault(); // or a letter key would type itself into the box it opens
+      this.input.reset();
+      this.input.enabled = false;
+      this.chatBox.value = '';
+      this.chatBox.classList.add('open');
+      this.chatBox.focus();
+    } else if (isKey(keys, 'mute', e.code)) {
       const on = this.audio.toggleMusic();
       if (on !== this.audio.sfxOn) this.audio.toggleSfx();
     }
@@ -326,6 +351,22 @@ export class GameView {
         this.spitAt = now;
         this.audio.play('whoosh');
         break;
+      case 'respawn':
+        this.audio.play('respawn');
+        this.effects.push({ kind: 'splash', x, y, at: now, color: '#ffffff' });
+        this.effects.push({ kind: 'text', x, y: y - 40, at: now, text: '復活！', color: '#b9f6ca' });
+        break;
+      case 'fire':
+        this.audio.play('cannon');
+        this.effects.push({ kind: 'splash', x, y, at: now, color: '#cfd8dc' });
+        break;
+      case 'glitch':
+        this.audio.play('glitch');
+        break;
+      case 'crash':
+        if (mine) this.audio.play('crash');
+        this.effects.push({ kind: 'text', x, y: y - 40, at: now, text: '當機！', color: '#ff8a80' });
+        break;
       case 'end':
         break;
     }
@@ -342,23 +383,39 @@ export class GameView {
     const me = this.me;
     const won = !!me && r.winners.includes(me.id);
     const title = r.draw ? '平手' : won ? '勝利！' : '落敗…';
-    const rows = [...this.info.players]
-      .sort((a, b) => a.slot - b.slot)
-      .map((p) => {
-        const st = r.stats[p.id] ?? { kills: 0, rescues: 0, trapped: 0, items: 0 };
-        const ch = CHARACTERS[p.char]!;
-        return h(
-          'tr',
-          { class: r.winners.includes(p.id) ? 'win' : '' },
-          h('td', null, `P${p.slot + 1}`),
-          h('td', null, p.name, p.id === me?.id ? '（你）' : p.bot !== undefined ? `（${BOT_LEVELS[p.bot]}）` : ''),
-          h('td', null, `${ch.animal}${ch.name}`),
-          h('td', null, String(st.kills)),
-          h('td', null, String(st.rescues)),
-          h('td', null, String(st.trapped)),
-          h('td', null, String(st.items)),
-        );
-      });
+    const dm = this.deathmatch;
+    const stat = (id: string) => r.stats[id] ?? NO_STATS;
+    // deathmatch ranks by kills, then fewer deaths; survival keeps the seat order
+    const players = [...this.info.players].sort((a, b) =>
+      dm ? stat(b.id).kills - stat(a.id).kills || stat(a.id).deaths - stat(b.id).deaths || a.slot - b.slot : a.slot - b.slot,
+    );
+    const head = dm ? ['名次', '玩家', '角色', '擊殺', '死亡', '救援', '道具'] : ['', '玩家', '角色', '擊破', '救援', '被困', '道具'];
+    const rows = players.map((p, k) => {
+      const st = stat(p.id);
+      const ch = CHARACTERS[p.char]!;
+      const cols = dm
+        ? [st.kills, st.deaths, st.rescues, st.items]
+        : [st.kills, st.rescues, st.trapped, st.items];
+      return h(
+        'tr',
+        { class: r.winners.includes(p.id) ? 'win' : '' },
+        h('td', null, dm ? String(k + 1) : `P${p.slot + 1}`),
+        h('td', null, p.name, p.id === me?.id ? '（你）' : p.bot !== undefined ? `（${BOT_LEVELS[p.bot]}）` : ''),
+        h('td', null, `${ch.animal}${ch.name}`),
+        ...cols.map((v) => h('td', null, String(v))),
+      );
+    });
+    let reason = r.reason === 'time' ? '時間到' : '全員擊倒';
+    if (dm) reason = r.reason === 'time' ? '時間到，比擊殺數' : '對手都離開了';
+    const teams =
+      dm && this.info.mode === 'team'
+        ? TEAMS.map((t, k) => {
+            const members = this.info.players.filter((p) => p.team === k);
+            const kills = members.reduce((n, p) => n + stat(p.id).kills, 0);
+            const deaths = members.reduce((n, p) => n + stat(p.id).deaths, 0);
+            return `${t.label} 擊殺 ${kills}・死亡 ${deaths}`;
+          }).join('　')
+        : '';
     this.overlay = h(
       'div',
       { class: 'results' },
@@ -366,17 +423,9 @@ export class GameView {
         'div',
         { class: 'results-card' },
         h('h2', { class: r.draw ? 'draw' : won ? 'win' : 'lose' }, title),
-        h('p', { class: 'muted' }, r.reason === 'time' ? '時間到' : '全員擊倒'),
-        h(
-          'table',
-          null,
-          h(
-            'thead',
-            null,
-            h('tr', null, ...['', '玩家', '角色', '擊破', '救援', '被困', '道具'].map((t) => h('th', null, t))),
-          ),
-          h('tbody', null, rows),
-        ),
+        h('p', { class: 'muted' }, dm ? `${RULE_NAMES.deathmatch}・${reason}` : reason),
+        teams ? h('p', null, teams) : null,
+        h('table', null, h('thead', null, h('tr', null, ...head.map((t) => h('th', null, t)))), h('tbody', null, rows)),
         h('p', { class: 'muted' }, '稍後自動回到候機室'),
         h('button', { class: 'btn', onclick: () => this.overlay?.remove() }, '關閉'),
       ),
@@ -505,6 +554,7 @@ export class GameView {
     ctx.rect(0, 0, FIELD_W, FIELD_H);
     ctx.clip();
     ctx.drawImage(this.floor, 0, 0);
+    this.code?.draw(ctx, this.scale);
 
     const f2 = Math.floor(now / 400) % 2;
     const f4 = Math.floor(now / 110) % 4;
@@ -528,6 +578,7 @@ export class GameView {
       const item = code && code !== '.' ? ITEM_BY_CODE[code] : undefined;
       if (item) draws.push({ y: y + 1, fn: () => this.drawItem(item, x, y, now, i) });
     }
+    this.drawErrors(world.a, now); // over the floor, under blocks, items and players
     if (this.machine) {
       const m = this.machine;
       draws.push({ y: m.y + TILE * 1.5, fn: () => this.drawMachine(world.a, now) });
@@ -550,7 +601,11 @@ export class GameView {
     const shown: SnapPlayer[] = [];
     for (const info of this.info.players) {
       const p = this.me && info.id === this.me.id && self ? this.playerAt(self, info.id) : this.playerAt(world, info.id);
-      if (!p || p.s === 2) continue;
+      if (!p) continue;
+      if (p.s === 2) {
+        if (p.rs > 0) draws.push({ y: p.y + 14, fn: () => this.drawRespawn(p, info, now) });
+        continue;
+      }
       const friend = this.friend(p.i);
       const inBush = this.tileAt(p.x, p.y) === '*';
       if (!friend && inBush && p.a === 0) continue;
@@ -584,6 +639,7 @@ export class GameView {
     }
     this.drawEffects(now);
     if ((MAPS[this.info.map] ?? MAPS[0]!).night) this.drawNight(world, self);
+    if (this.code) this.drawCrashed(self, now);
     ctx.restore();
   }
 
@@ -601,6 +657,71 @@ export class GameView {
     ctx.fill();
     const drop = (1 - k) * (1 - k) * 220;
     air.push(() => ctx.drawImage(closedSprite(), x, y - 8 - drop, TILE, 48));
+  }
+
+  /**
+   * 程式碼空間: a region throwing an error glows red and prints its crash (standing there slows you right
+   * down); once the error is over the region loads other code.
+   */
+  private drawErrors(s: Snapshot, now: number): void {
+    if (!this.code) return;
+    const live = new Set((s.ce ?? []).map(([region]) => region));
+    for (const region of this.erroring) if (!live.has(region)) this.code.reload(region);
+    this.erroring = live;
+    for (const region of live) this.code.drawError(this.ctx, region, now);
+  }
+
+  /** 程式碼空間: an error just caught me, so my screen is covered by glitches that clear tile by tile. */
+  private drawCrashed(self: Sample | null, now: number): void {
+    const me = this.me && self ? this.playerAt(self, this.me.id) : undefined;
+    const left = me && me.s !== 2 ? me.cr : 0;
+    if (me && left > 0 && (!this.crash || left > this.crashLeft)) {
+      const region = this.regionOf[Math.floor(me.y / TILE) * COLS + Math.floor(me.x / TILE)] ?? -1;
+      this.crash = { release: crashRelease(this.regionOf.length), message: this.code?.crashOf(region) ?? '' };
+    }
+    this.crashLeft = left;
+    if (left <= 0 || !this.crash) {
+      this.crash = null;
+      return;
+    }
+    drawCrash(this.ctx, 1 - left / RULES.codeCrash, this.crash.release, this.crash.message, now, FIELD_W, FIELD_H, FONT);
+  }
+
+  /** Am I standing on a region that is throwing an error (and not flying over it)? */
+  private onError(s: Snapshot, p: SnapPlayer): boolean {
+    if (!s.ce?.length || MOUNT_BY_CODE[p.mt] === 'ufo') return false;
+    const region = this.regionOf[Math.floor(p.y / TILE) * COLS + Math.floor(p.x / TILE)] ?? -1;
+    return s.ce.some(([r]) => r === region);
+  }
+
+  /** Deathmatch: where a player went down, a faint ghost and a countdown until they come back. */
+  private drawRespawn(p: SnapPlayer, info: GamePlayerInfo, now: number): void {
+    const ctx = this.ctx;
+    const ch = CHARACTERS[info.char] ?? CHARACTERS[0]!;
+    ctx.globalAlpha = 0.25 + 0.1 * Math.sin(now / 120);
+    ctx.drawImage(characterSprite(ch.key, info.color, 2, 0), Math.round(p.x - 20), Math.round(p.y - 34), 40, 48);
+    ctx.globalAlpha = 1;
+    const cy = p.y - 12;
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(p.x, cy, 14, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.strokeStyle = '#b9f6ca';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(p.x, cy, 14, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (p.rs / RULES.respawn));
+    ctx.stroke();
+    ctx.font = `900 16px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(20,30,60,0.8)';
+    const text = String(Math.ceil(p.rs / TICK_RATE));
+    ctx.strokeText(text, p.x, cy + 1);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(text, p.x, cy + 1);
+    ctx.textBaseline = 'alphabetic';
   }
 
   /** The ring that closes next flashes red, with a countdown, for the last seconds. */
@@ -783,7 +904,10 @@ export class GameView {
       ctx.stroke();
     }
     let y = p.y - 34 - jump - (moving && frame ? 1 : 0);
-    if (mount) {
+    if (mount === 'tank') {
+      ctx.drawImage(tankSprite(p.f || 2), p.x - 32, p.y - 18 - jump, 64, 36);
+      y -= 12;
+    } else if (mount) {
       ctx.drawImage(mountSprite(mount), p.x - 24, p.y - 12 - jump, 48, 32);
       y -= 12;
     }
@@ -953,7 +1077,7 @@ export class GameView {
     ctx.fillStyle = 'rgba(0,0,0,0.25)';
     ctx.fillRect(x0, 0, VIEW_W - x0, VIEW_H);
     const map = MAPS[this.info.map] ?? MAPS[0]!;
-    this.label(map.name, x0 + 100, 24, 15, '#fff');
+    this.label(this.deathmatch ? `${RULE_NAMES.deathmatch}・${map.name}` : map.name, x0 + 100, 24, 15, '#fff');
     const secs = Math.max(0, Math.ceil(s.tl / TICK_RATE));
     const low = s.ph === 1 && secs <= 30;
     const time = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
@@ -996,8 +1120,11 @@ export class GameView {
       this.label(this.fitText(info.name, 100, 14), x0 + 76, y + 44, 14, '#fff', 'left');
       let status = '存活';
       let color = '#a5d6a7';
-      if (!p || p.s === 2) {
-        status = '淘汰';
+      if (p && p.s === 2 && p.rs > 0) {
+        status = `${(p.rs / TICK_RATE).toFixed(1)}s 後復活`;
+        color = '#b9f6ca';
+      } else if (!p || p.s === 2) {
+        status = this.deathmatch ? '離開' : '淘汰';
         color = '#ef9a9a';
       } else if (p.s === 1) {
         status = `被困 ${(p.tt / TICK_RATE).toFixed(1)}s`;
@@ -1007,11 +1134,21 @@ export class GameView {
         color = '#bdbdbd';
       }
       this.label(status, x0 + 76, y + 66, 12, color, 'left');
-      const who = info.bot !== undefined ? ` · 電腦${BOT_LEVELS[info.bot]}` : '';
-      this.label(this.fitText(`${ch.animal}${ch.name}${who}`, 110, 11), x0 + 76, y + 86, 11, 'rgba(255,255,255,0.6)', 'left');
+      if (this.deathmatch && p) {
+        this.label(`擊殺 ${p.kl}　死亡 ${p.dt}`, x0 + 76, y + 86, 12, '#ffe082', 'left');
+      } else {
+        const who = info.bot !== undefined ? ` · 電腦${BOT_LEVELS[info.bot]}` : '';
+        this.label(this.fitText(`${ch.animal}${ch.name}${who}`, 110, 11), x0 + 76, y + 86, 11, 'rgba(255,255,255,0.6)', 'left');
+      }
     });
-    // what the round has in store: the next ring, the balloon machine
+    // what the round has in store: the next ring, the balloon machine; team deathmatch: the score
     let ly = 534;
+    if (this.deathmatch && this.info.mode === 'team') {
+      const kills = TEAMS.map((_, k) =>
+        this.info.players.filter((x) => x.team === k).reduce((n, x) => n + (s.p.find((q) => q.i === x.id)?.kl ?? 0), 0),
+      );
+      this.label(`${TEAMS[0].label} ${kills[0]} : ${kills[1]} ${TEAMS[1].label}`, x0 + 100, ly - 20, 13, '#ffe082');
+    }
     if (s.zt >= 0 && (s.zt <= 15 * TICK_RATE || s.zn > 0)) {
       const warn = s.zt <= RULES.shrinkWarn;
       const text = `縮圈 ${Math.ceil(s.zt / TICK_RATE)} 秒（第 ${s.zn + 1}/${RULES.shrinkRings} 圈）`;
@@ -1049,7 +1186,8 @@ export class GameView {
     const ch = CHARACTERS[me.char] ?? CHARACTERS[0]!;
     ctx.drawImage(characterSprite(ch.key, me.color, 2, 0), 12, y0 + 18, 40, 48);
     if (p.s === 2) {
-      this.label('你已被淘汰，觀戰中', 300, y0 + 46, 16, '#ffcdd2');
+      if (p.rs > 0) this.label(`被擊倒了，${Math.ceil(p.rs / TICK_RATE)} 秒後在原地復活`, 300, y0 + 46, 16, '#b9f6ca');
+      else this.label('你已被淘汰，觀戰中', 300, y0 + 46, 16, '#ffcdd2');
       return;
     }
     const rows: [string, number, readonly [number, number]][] = [
@@ -1081,6 +1219,11 @@ export class GameView {
     if (mount) {
       ctx.drawImage(itemSprite(mount), ax, y0 + 14, 28, 28);
       this.label('坐騎', ax + 14, y0 + 56, 10, '#fff');
+      ax += 34;
+    }
+    if (p.ep) {
+      ctx.drawImage(itemSprite('eyepatch'), ax, y0 + 14, 28, 28);
+      this.label('眼罩', ax + 14, y0 + 56, 10, '#fff');
     }
     // active item slot
     ctx.fillStyle = 'rgba(255,255,255,0.15)';
@@ -1094,13 +1237,20 @@ export class GameView {
     } else {
       this.label('道具', 462, y0 + 40, 12, 'rgba(255,255,255,0.5)');
     }
-    this.label('Ctrl / Z', 462, y0 + 77, 10, 'rgba(255,255,255,0.6)');
-    const hint =
-      p.cu === 'r' ? '中了惡魔：方向顛倒！' : p.cu === 'a' ? '中了惡魔：停不下來放水球！' : p.iv > 0 ? '坐騎掉了：短暫無敵' : '';
+    const keys = this.input.keys;
+    this.label(this.fitText(keysText(keys, 'item'), 58, 10), 462, y0 + 77, 10, 'rgba(255,255,255,0.6)');
+    let hint = '';
+    if (p.cu === 'r') hint = '中了惡魔：方向顛倒！';
+    else if (p.cu === 'a') hint = '中了惡魔：停不下來放水球！';
+    else if (p.cr > 0) hint = '程式當機：畫面恢復中…';
+    else if (this.onError(s, p)) hint = '踩到 error：移動大幅變慢';
+    else if (p.iv > 0) hint = '短暫無敵中';
+    else if (mount === 'tank') hint = '戰車：放水球鍵往前發射';
     if (hint) this.label(hint, 300, y0 + 76, 12, p.cu ? '#ce93d8' : '#ffe082');
-    this.label('方向鍵移動', 590, y0 + 26, 11, 'rgba(255,255,255,0.7)', 'right');
-    this.label('Space 放水球', 590, y0 + 44, 11, 'rgba(255,255,255,0.7)', 'right');
-    this.label('Enter 聊天 · M 靜音', 590, y0 + 62, 11, 'rgba(255,255,255,0.7)', 'right');
+    const dim = 'rgba(255,255,255,0.7)';
+    this.label('方向鍵移動', 590, y0 + 26, 11, dim, 'right');
+    this.label(this.fitText(`${keysText(keys, 'balloon')} 放水球`, 110, 11), 590, y0 + 44, 11, dim, 'right');
+    this.label(this.fitText(`${keysText(keys, 'chat')} 聊天 · ${keysText(keys, 'mute')} 靜音`, 110, 11), 590, y0 + 62, 11, dim, 'right');
   }
 
   private drawOverlay(s: Snapshot, now: number): void {

@@ -3,6 +3,10 @@
 
 這個資料夾就是完整的伺服器，不需要 npm install，也不需要 nginx。
 
+注意：如果這台電腦用 Game Hub 啟動與看管這個遊戲，就不要再雙擊 start-server.bat
+（會跟 hub 開的那一份搶同一個埠）。這時更新、重啟都交給 hub：更新前在這個資料夾放
+maintenance.txt，等 hub 顯示維護中再覆蓋檔案，最後刪掉 maintenance.txt。
+
   dist\               遊戲本體（網頁與伺服器）
   start-server.bat    啟動伺服器
   open-firewall.bat   開放防火牆（第一次用，需要系統管理員）
@@ -25,7 +29,7 @@
      水球大亂鬥伺服器已啟動（Node v22.18.0）
        同事：http://<這台電腦的 IP>:3000
 4. 把「同事：」那一行的網址給大家，用 Chrome 或 Edge 開啟即可遊玩。
-5. 檢查服務：瀏覽器開 http://<IP>:3000/healthz ，看到 {"ok":true,"version":"0.2.0",...} 就是正常；
+5. 檢查服務：瀏覽器開 http://<IP>:3000/healthz ，看到 {"ok":true,"version":"0.3.0",...} 就是正常；
    version 是目前跑的版本（暱稱畫面下方也會顯示）。
 
 啟動器發生任何錯誤時，視窗會停在錯誤訊息，不會自己關掉。

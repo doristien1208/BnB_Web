@@ -1,6 +1,6 @@
 # 水球大亂鬥 (BnB web remake)
 
-Web remake of Crazy Arcade BnB (爆爆王) rules: 2–4 player WebSocket battles, lobby + waiting room, 11 maps + random, 6 characters with colour swaps, computer players (3 levels). Every round also has the shrink (from 55 s left), supply drops (every 30 s) and 1 s of invulnerability after losing a mount. Design doc (Claude Doc): https://claude.ai/code/artifact/9270377b-274a-4b60-b7df-350ee3facc7d — keep it in sync when rules or protocol change.
+Web remake of Crazy Arcade BnB (爆爆王) rules: 2–4 player WebSocket battles, lobby + waiting room, survival or deathmatch rules, 13 maps + random, 6 characters with colour swaps, computer players (3 levels), rebindable keys. Every round also has the shrink (from 55 s left), supply drops (every 30 s) and 1 s of invulnerability after losing a mount. Design doc (Claude Doc): https://claude.ai/code/artifact/9270377b-274a-4b60-b7df-350ee3facc7d — keep it in sync when rules or protocol change.
 
 ## Constraints
 - Node.js 22.18.0 everywhere: the test machine runs exactly this (`nvm use` reads `.nvmrc`). Don't rely on newer Node APIs.
@@ -22,5 +22,6 @@ Web remake of Crazy Arcade BnB (爆爆王) rules: 2–4 player WebSocket battles
 - `shared/sim/game.ts` — authoritative simulation; the server steps it at 60 Hz and streams full snapshots
 - `shared/sim/bot.ts` — computer players: read the simulation, predict streams (chains, belts, ice slides), set inputs like a keyboard; `server/room.ts` runs them before each step
 - `server/hub.ts` sessions + lobby, `server/room.ts` waiting room + game loop, `server/app.ts` HTTP + `/ws` with Origin check
-- `client/main.ts` screens, `client/game/view.ts` canvas renderer + interpolation, `client/game/playback.ts` jitter-adaptive playback clock (stutter fix; `tests/playback.test.ts` simulates Windows timers + Wi-Fi jitter), `client/sandbox.ts` offline practice (`?sandbox&map=0..10&n=1..4&mode=team&ai=0..2&watch&time=60`)
+- `client/main.ts` screens, `client/game/view.ts` canvas renderer + interpolation, `client/game/playback.ts` jitter-adaptive playback clock (stutter fix; `tests/playback.test.ts` simulates Windows timers + Wi-Fi jitter), `client/sandbox.ts` offline practice (`?sandbox&map=0..12&n=1..4&mode=team&dm&ai=0..2&watch&time=60`, `dm` = deathmatch)
+- `client/keys.ts` key bindings (stored by `KeyboardEvent.code` in localStorage, re-checked on load); `client/ui/keys.ts` the editor inside the settings modal
 - `VERSION` in `shared/constants.ts` shows on the entry screen and in `/healthz`; bump it with `package.json` for each release

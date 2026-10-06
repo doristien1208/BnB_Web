@@ -851,3 +851,72 @@ h4 {
       'chat go';
   }
 }
+
+/* ------------------------------------------------------------ key settings */
+
+.modal.wide {
+  width: min(560px, 94vw);
+}
+
+.key-table td {
+  padding: 5px 10px 5px 0;
+  vertical-align: middle;
+}
+
+.key-slot {
+  display: inline-block;
+  min-width: 64px;
+  margin: 0 6px 0 0;
+  padding: 5px 10px;
+  border: 2px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink);
+  font: 700 14px var(--font);
+  text-align: center;
+  cursor: pointer;
+}
+
+.key-slot:hover {
+  border-color: var(--blue);
+}
+
+.key-slot.empty {
+  color: var(--muted);
+  border-style: dashed;
+}
+
+.key-slot.fixed {
+  cursor: default;
+  background: #f4f2f8;
+  color: var(--muted);
+}
+
+.key-slot.capturing {
+  border-color: var(--primary);
+  background: #fff3e8;
+  animation: key-wait 0.9s ease-in-out infinite;
+}
+
+@keyframes key-wait {
+  50% {
+    border-color: var(--primary-dark);
+    background: #ffe3cc;
+  }
+}
+
+.key-notice {
+  min-height: 1.4em;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.key-notice.bad {
+  color: #d32f2f;
+  font-weight: 700;
+}
+
+.entry-tools {
+  display: flex;
+  justify-content: center;
+}

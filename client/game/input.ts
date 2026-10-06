@@ -1,22 +1,11 @@
 import type { Dir } from '../../shared/types';
-
-const DIR_KEYS: Record<string, Dir> = {
-  ArrowUp: 1,
-  ArrowDown: 2,
-  ArrowLeft: 3,
-  ArrowRight: 4,
-  KeyW: 1,
-  KeyS: 2,
-  KeyA: 3,
-  KeyD: 4,
-};
-// Ctrl is the original item key; Z (Mac, where Ctrl+arrows switch desktops) and K (WASD layout) also work.
-const BALLOON_KEYS = new Set(['Space', 'KeyJ']);
-const ITEM_KEYS = new Set(['ControlLeft', 'ControlRight', 'KeyZ', 'KeyK']);
+import { MOVE_KEYS, isKey, loadBindings, type Bindings } from '../keys';
 
 /** Tracks held directions (newest wins, the previous one is the fallback) and edge-triggered actions. */
 export class Input {
   enabled = true;
+  /** the player's key settings, read when the round starts (they cannot change mid-round) */
+  readonly keys: Bindings = loadBindings();
   private held: Dir[] = [];
   private last = '';
 
@@ -42,23 +31,23 @@ export class Input {
 
   private readonly down = (e: KeyboardEvent): void => {
     if (!this.enabled) return;
-    const d = DIR_KEYS[e.code];
+    const d = MOVE_KEYS[e.code];
     if (d !== undefined) {
       e.preventDefault();
       this.held = this.held.filter((x) => x !== d);
       this.held.push(d);
       this.emit();
-    } else if (BALLOON_KEYS.has(e.code)) {
+    } else if (isKey(this.keys, 'balloon', e.code)) {
       e.preventDefault();
       if (!e.repeat) this.onAction('b');
-    } else if (ITEM_KEYS.has(e.code)) {
+    } else if (isKey(this.keys, 'item', e.code)) {
       e.preventDefault();
       if (!e.repeat) this.onAction('u');
     }
   };
 
   private readonly up = (e: KeyboardEvent): void => {
-    const d = DIR_KEYS[e.code];
+    const d = MOVE_KEYS[e.code];
     if (d === undefined) return;
     this.held = this.held.filter((x) => x !== d);
     this.emit();

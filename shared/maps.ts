@@ -9,6 +9,8 @@ import type { ItemType } from './items';
  *   1-4  spawn points (floor)
  * At run time the shrink turns closed rings into `%` (solid, like `#`).
  * Every map is mirror-symmetric on both axes; tests/maps.test.ts enforces this and spawn safety.
+ * `regions` (程式碼空間) uses the same 15 x 13 layout: a letter per tile names the code region that can
+ * throw an error there, `.` is a gutter that never does. `startItems` lie on the floor when the round starts.
  */
 export type ThemeKey =
   | 'village'
@@ -21,7 +23,9 @@ export type ThemeKey =
   | 'graveyard'
   | 'arena'
   | 'maze'
-  | 'balloonworks';
+  | 'balloonworks'
+  | 'field'
+  | 'code';
 
 export interface MapDef {
   id: number;
@@ -34,6 +38,8 @@ export interface MapDef {
   night?: boolean;
   dropRate?: number;
   weights?: Partial<Record<ItemType, number>>;
+  regions?: readonly string[];
+  startItems?: readonly (readonly [col: number, row: number, item: ItemType])[];
 }
 
 export const MAPS: readonly MapDef[] = [
@@ -89,8 +95,8 @@ export const MAPS: readonly MapDef[] = [
     name: '海盜港灣',
     tag: '水道 + 可推木桶',
     stars: 2,
-    desc: '中央水道分隔上下，只有 3 座橋；水柱可隔水攻擊',
-    weights: { pirateTurtle: 5 },
+    desc: '中央水道分隔上下，只有 3 座橋；水柱可隔水攻擊；海盜眼罩讓烏龜、貓頭鷹跑更快',
+    weights: { pirateTurtle: 5, eyepatch: 4 },
     grid: [
       '1.xoxx.x.xxox.2',
       '.#x#x#o#o#x#x#.',
@@ -292,6 +298,72 @@ export const MAPS: readonly MapDef[] = [
       'xxx.x.xxx.x.xxx',
       '.#x#xx#x#xx#x#.',
       '3.xxxx.x.xxxx.4',
+    ],
+  },
+  {
+    id: 11,
+    key: 'field',
+    name: '野戰前線',
+    tag: '戰車坐騎',
+    stars: 3,
+    desc: '中央橫貫全場的長走道適合戰車遠射；左右各停一台戰車，木箱也可能掉出戰車',
+    weights: { tank: 4 },
+    startItems: [
+      [4, 6, 'tank'],
+      [10, 6, 'tank'],
+    ],
+    grid: [
+      '1..xxx.x.xxx..2',
+      '.#.#x#...#x#.#.',
+      '.x...x###x...x.',
+      'x#x#.x...x.#x#x',
+      'x...xx.#.xx...x',
+      '#x#x*#...#*x#x#',
+      '...............',
+      '#x#x*#...#*x#x#',
+      'x...xx.#.xx...x',
+      'x#x#.x...x.#x#x',
+      '.x...x###x...x.',
+      '.#.#x#...#x#.#.',
+      '3..xxx.x.xxx..4',
+    ],
+  },
+  {
+    id: 12,
+    key: 'code',
+    name: '程式碼空間',
+    tag: 'error 區塊',
+    stars: 2,
+    desc: '六個程式區塊會無預警出 error 3 秒：踩上去大幅變慢，畫面還會當機一下；中線與兩條橫線不會出錯',
+    grid: [
+      '1.xx.xx.xx.xx.2',
+      '.#x#..x.x..#x#.',
+      'xx.##x...x##.xx',
+      'x#x...x#x...x#x',
+      '.x.x#x...x#x.x.',
+      'x#.x...#...x.#x',
+      '.xx..x...x..xx.',
+      'x#.x...#...x.#x',
+      '.x.x#x...x#x.x.',
+      'x#x...x#x...x#x',
+      'xx.##x...x##.xx',
+      '.#x#..x.x..#x#.',
+      '3.xx.xx.xx.xx.4',
+    ],
+    regions: [
+      'aaaaaaa.bbbbbbb',
+      'aaaaaaa.bbbbbbb',
+      'aaaaaaa.bbbbbbb',
+      'aaaaaaa.bbbbbbb',
+      '...............',
+      'ccccccc.ddddddd',
+      'ccccccc.ddddddd',
+      'ccccccc.ddddddd',
+      '...............',
+      'eeeeeee.fffffff',
+      'eeeeeee.fffffff',
+      'eeeeeee.fffffff',
+      'eeeeeee.fffffff',
     ],
   },
 ];

@@ -4,6 +4,7 @@ import { MAX_PLAYERS, RULES, TICK_MS } from '../shared/constants';
 import { MAPS } from '../shared/maps';
 import {
   BOT_LEVELS,
+  RULE_NAMES,
   type BotLevel,
   type C2S,
   type GameStartInfo,
@@ -36,7 +37,7 @@ interface Member {
 
 export class Room {
   readonly members: Member[] = [];
-  config: RoomConfig = { map: -1, mode: 'ffa', assign: 'free', time: 180 };
+  config: RoomConfig = { map: -1, mode: 'ffa', rule: 'survival', assign: 'free', time: 180 };
   phase: RoomPhase = 'waiting';
   private game: Game | null = null;
   private bots: Bot[] = [];
@@ -205,6 +206,7 @@ export class Room {
         this.members.forEach((x, k) => (x.team = k % 2));
       }
     }
+    if (msg.rule) this.config.rule = msg.rule;
     if (msg.assign) this.config.assign = msg.assign;
     if (msg.time !== undefined) this.config.time = msg.time;
     this.broadcastRoom();
@@ -262,6 +264,7 @@ export class Room {
     this.info = {
       map,
       mode: this.config.mode,
+      rule: this.config.rule,
       time: this.config.time,
       players: this.members.map((x) => ({
         id: x.id,
@@ -275,6 +278,7 @@ export class Room {
     };
     const game = new Game(MAPS[map]!, this.info.players, {
       mode: this.config.mode,
+      rule: this.config.rule,
       time: this.config.time,
       seed: Math.floor(Math.random() * 2 ** 31),
     });
@@ -287,7 +291,7 @@ export class Room {
     this.nextTickAt = performance.now();
     this.broadcast({ t: 'start', game: this.info });
     const bots = this.bots.length ? `（含電腦 ${this.bots.length}）` : '';
-    log(`房間 #${this.id} 開局：${MAPS[map]!.name}，${n} 人${bots}，${team ? '團隊戰' : '個人戰'}`);
+    log(`房間 #${this.id} 開局：${MAPS[map]!.name}，${n} 人${bots}，${RULE_NAMES[this.config.rule]}${team ? '團隊戰' : '個人戰'}`);
     this.broadcastRoom();
     this.hub.markLobby();
   }
@@ -336,7 +340,9 @@ export class Room {
     if (result) {
       this.broadcast({ t: 'end', result });
       const names = this.members.filter((x) => result.winners.includes(x.id)).map((x) => x.name);
-      log(`房間 #${this.id} 結束：${result.draw ? '平手' : `${names.join('、')} 獲勝`}（${result.reason === 'time' ? '時間到' : '全員擊倒'}）`);
+      const dm = this.info?.rule === 'deathmatch';
+      const why = result.reason === 'time' ? (dm ? '時間到，比擊殺數' : '時間到') : dm ? '對手都離開了' : '全員擊倒';
+      log(`房間 #${this.id} 結束：${result.draw ? '平手' : `${names.join('、')} 獲勝`}（${why}）`);
     }
     this.broadcastRoom();
     this.hub.markLobby();
@@ -386,6 +392,7 @@ export class Room {
       name: this.name,
       host: this.host?.name ?? '',
       map: this.info ? this.info.map : this.config.map,
+      rule: this.config.rule,
       players: this.members.length,
       bots: this.members.filter((x) => x.bot !== null).length,
       phase: this.phase,

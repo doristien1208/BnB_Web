@@ -50,11 +50,10 @@ export function parseC2S(raw: string): C2S | null {
       return text === null ? null : { t: 'chat', text };
     }
     case 'config': {
-      const out: { t: 'config'; map?: number; mode?: 'ffa' | 'team'; assign?: 'free' | 'random'; time?: number } = {
-        t: 'config',
-      };
+      const out: Extract<C2S, { t: 'config' }> = { t: 'config' };
       if (m.map !== undefined) out.map = int(m.map, -1, MAPS.length - 1) ?? undefined;
       if (m.mode === 'ffa' || m.mode === 'team') out.mode = m.mode;
+      if (m.rule === 'survival' || m.rule === 'deathmatch') out.rule = m.rule;
       if (m.assign === 'free' || m.assign === 'random') out.assign = m.assign;
       if (typeof m.time === 'number' && (TIME_OPTIONS as readonly number[]).includes(m.time)) out.time = m.time;
       return out;

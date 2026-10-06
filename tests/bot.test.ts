@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { RULES, TICK_RATE } from '../shared/constants';
 import { MAPS, type MapDef } from '../shared/maps';
-import type { BotLevel, GamePlayerInfo, Mode } from '../shared/protocol';
+import type { BotLevel, GamePlayerInfo, Mode, Rule } from '../shared/protocol';
 import { Bot } from '../shared/sim/bot';
 import { ALIVE, DEAD, Game, TRAPPED, tileCenter, type Player } from '../shared/sim/game';
 
@@ -16,7 +16,11 @@ const OPEN: MapDef = {
 };
 
 /** Players p0.. with the given bot levels (null = an idle player); runs bots before every step. */
-function setup(map: MapDef, levels: (BotLevel | null)[], opts: { mode?: Mode; time?: number; seed?: number } = {}) {
+function setup(
+  map: MapDef,
+  levels: (BotLevel | null)[],
+  opts: { mode?: Mode; rule?: Rule; time?: number; seed?: number } = {},
+) {
   const mode = opts.mode ?? 'ffa';
   const seed = opts.seed ?? 5;
   const infos: GamePlayerInfo[] = levels.map((_, k) => ({
@@ -27,7 +31,7 @@ function setup(map: MapDef, levels: (BotLevel | null)[], opts: { mode?: Mode; ti
     team: mode === 'team' ? k % 2 : -1,
     slot: k,
   }));
-  const g = new Game(map, infos, { mode, time: opts.time ?? 180, seed });
+  const g = new Game(map, infos, { mode, rule: opts.rule, time: opts.time ?? 180, seed });
   g.countdown = 1;
   g.step();
   const bots = levels.flatMap((lv, k) => (lv === null ? [] : [new Bot(g, `p${k}`, lv, seed * 10 + k)]));
@@ -116,6 +120,19 @@ describe('computer players', () => {
     expect(P(0).active).toBeNull();
   });
 
+  it('makes no new decisions while an error has crashed its screen', () => {
+    const { tick, P } = setup(OPEN, [2, null]);
+    put(P(0), 4, 5);
+    put(P(1), 9, 5);
+    P(1).state = TRAPPED;
+    P(1).trapT = RULES.trapped;
+    P(0).crashT = RULES.codeCrash;
+    tick(RULES.codeCrash - 1);
+    expect([P(0).x, P(0).y]).toEqual([tileCenter(4), tileCenter(5)]);
+    tick(TICK_RATE * 2);
+    expect(P(1).state).toBe(DEAD);
+  });
+
   it('leaves the outer ring before it closes', () => {
     const { tick, P, g } = setup(OPEN, [1, null]);
     put(P(0), 0, 6);
@@ -131,5 +148,39 @@ describe('computer players', () => {
     tick(TICK_RATE * 125);
     expect(g.phase).toBe('over');
     expect(g.result).not.toBeNull();
+  });
+
+  it('fires from a tank at an opponent down the line without catching itself', () => {
+    const { g, tick, P } = setup(OPEN, [2, null]);
+    put(P(0), 2, 5);
+    put(P(1), 9, 5);
+    P(0).mount = 'tank';
+    P(0).face = 4;
+    let fired = 0;
+    tick(TICK_RATE * 6, () => {
+      put(P(1), 9, 5); // the target stands still
+      fired += g.balloons.filter((b) => b.owner === 'p0' && b.move?.kind === 'kick').length > 0 ? 1 : 0;
+    });
+    expect(fired).toBeGreaterThan(0);
+    expect(P(0).state).toBe(ALIVE);
+    expect(P(1).stats.deaths + (P(1).state === TRAPPED ? 1 : 0)).toBeGreaterThan(0);
+  });
+
+  it('four computer players keep at it through deathmatch rounds, and nobody stays down', () => {
+    let respawns = 0;
+    let kills = 0;
+    for (const id of [0, 11, 12]) {
+      const { g, tick } = setup(MAPS[id]!, [2, 1, 0, 2], { rule: 'deathmatch', time: 120, seed: id + 21 });
+      let stuck = false;
+      tick(TICK_RATE * 125, () => {
+        respawns += g.players.filter((p) => p.state === DEAD && p.respawnT === 1).length;
+        stuck ||= g.players.some((p) => p.state === DEAD && p.respawnT === 0 && !p.out);
+      });
+      expect(g.result?.reason, MAPS[id]!.name).toBe('time');
+      expect(stuck, MAPS[id]!.name).toBe(false);
+      kills += g.players.reduce((n, p) => n + p.stats.kills, 0);
+    }
+    expect(respawns).toBeGreaterThan(0);
+    expect(kills).toBeGreaterThan(0);
   });
 });

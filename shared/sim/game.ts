@@ -13,7 +13,7 @@ import {
   type MountType,
 } from '../items';
 import type { MapDef } from '../maps';
-import type { Fx, GamePlayerInfo, GameResult, Mode, PlayerStats, Snapshot } from '../protocol';
+import type { Fx, GamePlayerInfo, GameResult, Mode, PlayerStats, Rule, Snapshot } from '../protocol';
 import { Rng } from '../rng';
 import { DX, DY, OPPOSITE, type Dir } from '../types';
 
@@ -43,6 +43,21 @@ export const ringOf = (i: number) => {
   const r = Math.floor(i / COLS);
   return Math.min(c, r, COLS - 1 - c, ROWS - 1 - r);
 };
+
+/** Code regions of a map (程式碼空間): region index per tile (-1 = none), numbered by first appearance. */
+export function codeRegions(map: MapDef): { of: Int8Array; count: number } {
+  const of = new Int8Array(TILE_COUNT).fill(-1);
+  const letters: string[] = [];
+  map.regions?.forEach((row, r) =>
+    [...row].forEach((ch, c) => {
+      if (ch === '.' || !inBounds(c, r)) return;
+      let k = letters.indexOf(ch);
+      if (k < 0) k = letters.push(ch) - 1;
+      of[tileIndex(c, r)] = k;
+    }),
+  );
+  return { of, count: letters.length };
+}
 
 interface Flight {
   t: number;
@@ -103,6 +118,26 @@ export interface Player {
   connected: boolean;
   dcT: number;
   stats: PlayerStats;
+  /** deathmatch: ticks until a dead player comes back (0 = not coming back) */
+  respawnT: number;
+  /** where the player fell: deathmatch respawns them there */
+  deathTile: number;
+  /** left the round for good (left the room, or disconnected too long): never respawns */
+  out: boolean;
+  /** owner of the stream that trapped the player; '' for the balloon machine */
+  trappedBy: string | null;
+  /** pirate eyepatch: turtles and owls run faster */
+  eyepatch: boolean;
+  /** 程式碼空間: ticks the player's screen stays crashed, and the error that did it (each error crashes it once) */
+  crashT: number;
+  crashBy: number;
+}
+
+/** Speed level a player moves at: the mount's (an eyepatch speeds up turtles and owls), else their own. */
+export function moveLevel(p: Player): number {
+  if (!p.mount) return p.spd;
+  const bonus = p.eyepatch && (p.mount === 'turtle' || p.mount === 'owl') ? RULES.eyepatchBonus : 0;
+  return MOUNT_SPEED[p.mount] + bonus;
 }
 
 export interface Balloon {
@@ -120,6 +155,8 @@ export interface Balloon {
 
 export interface Blast {
   id: number;
+  /** the balloon's owner ('' = the balloon machine): who gets the kill in deathmatch */
+  owner: string;
   c: number;
   r: number;
   arms: [number, number, number, number];
@@ -145,8 +182,16 @@ export interface Drop {
   t: number;
 }
 
+/** A code region throwing an error: it slows everyone on it, and crashes the screen of each player it catches. */
+export interface CodeError {
+  id: number;
+  region: number;
+  t: number;
+}
+
 export interface GameOptions {
   mode: Mode;
+  rule?: Rule;
   time: number;
   seed: number;
 }
@@ -154,6 +199,7 @@ export interface GameOptions {
 export class Game {
   readonly map: MapDef;
   readonly mode: Mode;
+  readonly rule: Rule;
   grid: string[] = [];
   items: (ItemType | null)[];
   /** side of the player who laid the banana, or null */
@@ -169,6 +215,13 @@ export class Game {
   readonly machine: { c: number; r: number } | null = null;
   /** ticks until the machine fires */
   machineT: number = RULES.machineEvery;
+  /** code regions per tile (-1 = none) and how many there are; none outside 程式碼空間 */
+  readonly regionOf: Int8Array;
+  readonly regionCount: number;
+  /** regions throwing an error right now */
+  errors: CodeError[] = [];
+  /** ticks until the next regions throw an error */
+  errorT: number = RULES.codeStart;
   tick = 0;
   phase: 'countdown' | 'play' | 'over' = 'countdown';
   countdown: number = RULES.countdown;
@@ -194,6 +247,7 @@ export class Game {
   constructor(map: MapDef, infos: readonly GamePlayerInfo[], opts: GameOptions) {
     this.map = map;
     this.mode = opts.mode;
+    this.rule = opts.rule ?? 'survival';
     this.rng = new Rng(opts.seed);
     this.timeLeft = opts.time * TICK_RATE;
     this.shrinkOn = this.timeLeft > RULES.shrinkStart + RULES.shrinkWarn;
@@ -215,7 +269,11 @@ export class Game {
       this.machine = { c: avg((i) => i % COLS), r: avg((i) => Math.floor(i / COLS)) };
     }
     this.items = new Array<ItemType | null>(TILE_COUNT).fill(null);
+    for (const [c, r, t] of map.startItems ?? []) if (inBounds(c, r)) this.items[tileIndex(c, r)] = t;
     this.bananas = new Array<string | null>(TILE_COUNT).fill(null);
+    const regions = codeRegions(map);
+    this.regionOf = regions.of;
+    this.regionCount = regions.count;
     this.dropRate = map.dropRate ?? RULES.dropRate;
     this.dropTable = ITEM_TYPES.map((t): [ItemType, number] => [t, map.weights?.[t] ?? ITEMS[t].weight]).filter(
       ([, w]) => w > 0,
@@ -252,7 +310,10 @@ export class Game {
     const p = this.byId(id);
     if (!p) return;
     p.connected = false;
-    if (p.state !== DEAD && this.phase !== 'over') this.kill(p, null);
+    if (this.phase === 'over') return;
+    if (p.state !== DEAD) this.kill(p, null, false, true);
+    else p.respawnT = 0; // already down in deathmatch: they just don't come back
+    p.out = true;
   }
 
   byId(id: string): Player | undefined {
@@ -275,6 +336,8 @@ export class Game {
     this.timeLeft--;
     this.played++;
     this.updateShrink();
+    this.updateErrors();
+    this.updateRespawns();
     for (const p of this.players) this.updatePlayer(p);
     this.updateDarts();
     this.updateMachine();
@@ -320,6 +383,11 @@ export class Game {
         cl: p.cloakT,
         iv: p.invulnT,
         dc: p.connected ? 0 : 1,
+        rs: p.respawnT,
+        kl: p.stats.kills,
+        dt: p.stats.deaths,
+        ep: p.eyepatch ? 1 : 0,
+        cr: p.crashT,
       })),
       b: this.balloons.map((b) => ({
         i: b.id,
@@ -338,6 +406,7 @@ export class Game {
       fx: this.fx,
     };
     if (this.machine) s.mc = this.machineT;
+    if (this.regionCount) s.ce = this.errors.map((e): [number, number] => [e.region, e.t]);
     this.fx = [];
     if (this.gridVersion !== this.sentGrid) {
       s.g = this.grid.join('');
@@ -424,13 +493,21 @@ export class Game {
       actions: [],
       connected: true,
       dcT: 0,
-      stats: { kills: 0, rescues: 0, trapped: 0, items: 0 },
+      stats: { kills: 0, deaths: 0, rescues: 0, trapped: 0, items: 0 },
+      respawnT: 0,
+      deathTile: tileIndex(c, r),
+      out: false,
+      trappedBy: null,
+      eyepatch: false,
+      crashT: 0,
+      crashBy: 0,
     };
   }
 
   // ---------------------------------------------------------------- players
 
   private updatePlayer(p: Player): void {
+    if (p.crashT > 0) p.crashT--;
     if (p.state === DEAD) return;
     if (p.portalCd > 0) p.portalCd--;
     if (p.invulnT > 0) p.invulnT--;
@@ -439,7 +516,7 @@ export class Game {
       p.in2 = 0;
       p.actions.length = 0;
       if (++p.dcT >= RULES.disconnectGrace) {
-        this.kill(p, null);
+        this.kill(p, null, false, true);
         return;
       }
     }
@@ -473,7 +550,7 @@ export class Game {
     if (p.cloakT > 0) p.cloakT--;
 
     this.unstick(p);
-    const speed = speedPx(p.mount ? MOUNT_SPEED[p.mount] : p.spd) / TICK_RATE;
+    const speed = (speedPx(moveLevel(p)) / TICK_RATE) * (this.slowed(p) ? RULES.codeSlow : 1);
     let d1 = p.in1;
     let d2 = p.in2;
     if (p.curse === 'reverse') {
@@ -513,6 +590,7 @@ export class Game {
     this.checkBanana(p);
     this.checkPortal(p);
     this.pickup(p);
+    this.catchError(p);
   }
 
   private tileUnder(p: Player): string {
@@ -787,6 +865,12 @@ export class Game {
         p.glove = true;
         p.bag.push(t);
         break;
+      case 'eyepatch':
+        if (!p.eyepatch) {
+          p.eyepatch = true;
+          p.bag.push(t);
+        }
+        break;
       case 'greenDevil':
         this.greenDevil(p);
         break;
@@ -852,10 +936,17 @@ export class Game {
     return this.balloons.find((b) => !b.fly && this.balloonTile(b) === i);
   }
 
+  /** Balloons a player may have out at once: a tank holds RULES.tankExtra more. */
+  capacity(p: Player): number {
+    return p.bal + (p.mount === 'tank' ? RULES.tankExtra : 0);
+  }
+
   private placeBalloon(p: Player): void {
     if (p.state !== ALIVE || p.air || p.dismountT > 0) return;
     const i = tileIndex(p.tc, p.tr);
     if (!isFloorLike(this.grid[i])) return;
+    const room = this.balloons.filter((b) => b.owner === p.id).length < this.capacity(p);
+    if (p.mount === 'tank' && room && this.fire(p)) return;
     const existing = this.balloonAt(i);
     if (existing) {
       if (p.glove && existing.owner === p.id && existing.pass.has(p.id) && !existing.move) {
@@ -863,7 +954,7 @@ export class Game {
       }
       return;
     }
-    if (this.balloons.filter((b) => b.owner === p.id).length >= p.bal) return;
+    if (!room) return;
     const b: Balloon = {
       id: this.nextId++,
       owner: p.id,
@@ -878,6 +969,38 @@ export class Game {
     for (const q of this.players) if (q.state !== DEAD && this.overlapsTile(q, i)) b.pass.add(q.id);
     this.balloons.push(b);
     this.fx.push({ k: 'place', x: b.x, y: b.y, id: p.id });
+  }
+
+  /**
+   * A tank fires: the balloon comes out on the tile in front and slides on like a kicked one (its fuse
+   * waits until it stops). False when that tile is taken, so the balloon goes down under the tank instead.
+   */
+  private fire(p: Player): boolean {
+    const d = p.face || 2;
+    const c = p.tc + (DX[d] ?? 0);
+    const r = p.tr + (DY[d] ?? 0);
+    if (!inBounds(c, r)) return false;
+    const i = tileIndex(c, r);
+    if (!isFloorLike(this.grid[i]) || this.balloons.some((o) => !o.fly && (this.balloonTile(o) === i || o.move?.to === i))) {
+      return false;
+    }
+    if (this.players.some((q) => q !== p && q.state !== DEAD && !q.air && this.overlapsTile(q, i))) return false;
+    const b: Balloon = {
+      id: this.nextId++,
+      owner: p.id,
+      x: tileCenter(c),
+      y: tileCenter(r),
+      fuse: RULES.fuse,
+      pow: p.pow,
+      pass: new Set(this.overlapsTile(p, i) ? [p.id] : []),
+      move: null,
+      fly: null,
+    };
+    this.balloons.push(b);
+    const to = this.nextBalloonTile(b, c, r, d);
+    if (to >= 0) b.move = { dir: d, speed: RULES.kickSpeed / TICK_RATE, kind: 'kick', to };
+    this.fx.push({ k: 'fire', x: b.x, y: b.y, id: p.id });
+    return true;
   }
 
   private kick(b: Balloon, d: Dir, p: Player): void {
@@ -1040,6 +1163,7 @@ export class Game {
   private useNeedle(p: Player): void {
     p.state = ALIVE;
     p.trapT = 0;
+    p.trappedBy = null;
     this.consume(p, 1);
     // the stream lingers: a needle used too early gets you trapped again
     for (const bl of this.blasts) bl.hit.delete(p.id);
@@ -1104,6 +1228,7 @@ export class Game {
       const r = tileOf(b.y);
       const blast: Blast = {
         id: this.nextId++,
+        owner: b.owner,
         c,
         r,
         arms: [0, 0, 0, 0],
@@ -1174,7 +1299,7 @@ export class Game {
           this.unstick(p);
           this.fx.push({ k: 'dismount', id: p.id, x: p.x, y: p.y });
         } else {
-          this.trap(p);
+          this.trap(p, bl.owner);
         }
       }
       bl.t--;
@@ -1191,9 +1316,10 @@ export class Game {
     }
   }
 
-  private trap(p: Player): void {
+  private trap(p: Player, by: string): void {
     p.state = TRAPPED;
     p.trapT = RULES.trapped;
+    p.trappedBy = by;
     p.curse = null;
     p.curseT = 0;
     p.cloakT = 0;
@@ -1208,7 +1334,7 @@ export class Game {
     for (const p of this.players) {
       if (p.state !== TRAPPED) continue;
       if (--p.trapT <= 0) {
-        this.kill(p, null);
+        this.kill(p, this.trapCredit(p));
         continue;
       }
       for (const q of this.players) {
@@ -1217,6 +1343,7 @@ export class Game {
         if (this.mode === 'team' && q.team === p.team) {
           p.state = ALIVE;
           p.trapT = 0;
+          p.trappedBy = null;
           q.stats.rescues++;
           this.fx.push({ k: 'free', id: p.id, by: q.id, x: p.x, y: p.y });
         } else {
@@ -1227,16 +1354,32 @@ export class Game {
     }
   }
 
-  private kill(p: Player, by: Player | null, crushed = false): void {
+  /**
+   * Deathmatch: a bubble that bursts by itself counts for whoever's stream trapped the player, unless that
+   * was themselves, a teammate or the balloon machine. Survival never credits a burst bubble.
+   */
+  private trapCredit(p: Player): Player | null {
+    if (this.rule !== 'deathmatch' || !p.trappedBy) return null;
+    const q = this.byId(p.trappedBy);
+    return q && q !== p && q.side !== p.side ? q : null;
+  }
+
+  /** `permanent`: the player left (or stayed disconnected too long) and never respawns. */
+  private kill(p: Player, by: Player | null, crushed = false, permanent = false): void {
     if (p.state === DEAD) return;
     p.state = DEAD;
     p.trapT = 0;
+    p.trappedBy = null;
     p.mount = null;
     p.slide = 0;
     p.air = null;
     p.curse = null;
     p.cloakT = 0;
     p.invulnT = 0;
+    p.stats.deaths++;
+    p.deathTile = tileIndex(tileOf(p.x), tileOf(p.y));
+    p.respawnT = this.rule === 'deathmatch' && !permanent ? RULES.respawn : 0;
+    if (permanent || this.rule === 'survival') p.out = true;
     if (by) by.stats.kills++;
     this.fx.push({ k: crushed ? 'crush' : 'pop', id: p.id, by: by?.id, x: p.x, y: p.y });
     const spots = this.rng.shuffle(this.emptyTiles());
@@ -1250,11 +1393,15 @@ export class Game {
   }
 
   private checkEnd(): void {
-    const sides = new Set(this.players.filter((p) => p.state !== DEAD).map((p) => p.side));
+    // survival: the last side standing; deathmatch: nobody stays down, so only leaving ends it early
+    const sides = new Set(
+      this.players.filter((p) => (this.rule === 'deathmatch' ? !p.out : p.state !== DEAD)).map((p) => p.side),
+    );
     const ko = this.initialSides >= 2 ? sides.size <= 1 : sides.size === 0;
     if (!ko && this.timeLeft > 0) return;
     this.phase = 'over';
-    const winner = ko && sides.size === 1 ? [...sides][0] : undefined;
+    let winner = ko && sides.size === 1 ? [...sides][0] : undefined;
+    if (!ko && this.rule === 'deathmatch') winner = this.topSide();
     this.result = {
       draw: winner === undefined,
       winners: winner === undefined ? [] : this.players.filter((p) => p.side === winner).map((p) => p.id),
@@ -1262,6 +1409,121 @@ export class Game {
       stats: Object.fromEntries(this.players.map((p) => [p.id, { ...p.stats }])),
     };
     this.fx.push({ k: 'end' });
+  }
+
+  /** Deathmatch at the bell: most kills (a team adds theirs up), then fewest deaths; still level = draw. */
+  private topSide(): string | undefined {
+    const score = new Map<string, { kills: number; deaths: number }>();
+    for (const p of this.players) {
+      const s = score.get(p.side) ?? { kills: 0, deaths: 0 };
+      s.kills += p.stats.kills;
+      s.deaths += p.stats.deaths;
+      score.set(p.side, s);
+    }
+    const ranked = [...score].sort(([, a], [, b]) => b.kills - a.kills || a.deaths - b.deaths);
+    const [first, second] = ranked;
+    if (!first) return undefined;
+    if (second && second[1].kills === first[1].kills && second[1].deaths === first[1].deaths) return undefined;
+    return first[0];
+  }
+
+  // ---------------------------------------------------------------- deathmatch respawn
+
+  private updateRespawns(): void {
+    if (this.rule !== 'deathmatch') return;
+    for (const p of this.players) {
+      if (p.state === DEAD && p.respawnT > 0 && --p.respawnT === 0) this.respawn(p);
+    }
+  }
+
+  /**
+   * Back where they fell (or the nearest free floor when a balloon, a closing ring or an error is there),
+   * with the character's starting stats and a moment in which no stream can trap them.
+   */
+  private respawn(p: Player): void {
+    const closing = this.closingRing();
+    const free = (i: number) =>
+      isFloorLike(this.grid[i]) && !this.balloonAt(i) && ringOf(i) !== closing && !this.isError(i);
+    const i = free(p.deathTile) ? p.deathTile : this.nearest(p.deathTile, free);
+    if (i < 0) return;
+    const c = i % COLS;
+    const r = Math.floor(i / COLS);
+    Object.assign(p, {
+      x: tileCenter(c),
+      y: tileCenter(r),
+      tc: c,
+      tr: r,
+      face: 2,
+      moving: false,
+      state: ALIVE,
+      trapT: 0,
+      trappedBy: null,
+      dismountT: 0,
+      invulnT: RULES.respawnInvuln,
+      mount: null,
+      bal: p.base.bal,
+      pow: p.base.pow,
+      spd: p.base.spd,
+      kick: false,
+      glove: false,
+      eyepatch: false,
+      bag: [],
+      curse: null,
+      curseT: 0,
+      cloakT: 0,
+      active: null,
+      activeN: 0,
+      slide: 0,
+      slideIce: false,
+      portalCd: 0,
+      air: null,
+      pushT: 0,
+      ghost: new Set<number>(),
+      crashT: 0,
+    } satisfies Partial<Player>);
+    this.unstick(p);
+    this.fx.push({ k: 'respawn', id: p.id, x: p.x, y: p.y });
+  }
+
+  // ---------------------------------------------------------------- code regions
+
+  /** Every few seconds 1–2 regions throw an error for three seconds, without warning. */
+  private updateErrors(): void {
+    if (!this.regionCount) return;
+    for (const e of this.errors) e.t--;
+    this.errors = this.errors.filter((e) => e.t > 0);
+    if (--this.errorT > 0) return;
+    this.errorT = RULES.codeEveryMin + this.rng.int(RULES.codeEveryMax - RULES.codeEveryMin + 1);
+    const busy = new Set(this.errors.map((e) => e.region));
+    const idle = Array.from({ length: this.regionCount }, (_, k) => k).filter((k) => !busy.has(k));
+    const start = this.rng.shuffle(idle).slice(0, 1 + this.rng.int(2));
+    for (const region of start) this.errors.push({ id: this.nextId++, region, t: RULES.codeError });
+    if (start.length) this.fx.push({ k: 'glitch' });
+  }
+
+  /** The error a tile's region is throwing right now, if any. */
+  errorAt(i: number): CodeError | undefined {
+    const region = this.regionOf[i] ?? -1;
+    return region < 0 ? undefined : this.errors.find((e) => e.region === region);
+  }
+
+  isError(i: number): boolean {
+    return this.errorAt(i) !== undefined;
+  }
+
+  /** Standing on an error slows a player down; a UFO flies over it. */
+  private slowed(p: Player): boolean {
+    return this.regionCount > 0 && p.mount !== 'ufo' && this.isError(tileIndex(tileOf(p.x), tileOf(p.y)));
+  }
+
+  /** Walking onto an error, or one starting underfoot, crashes the player's screen: once per error. */
+  private catchError(p: Player): void {
+    if (!this.regionCount || p.mount === 'ufo') return;
+    const e = this.errorAt(tileIndex(tileOf(p.x), tileOf(p.y)));
+    if (!e || e.id === p.crashBy) return;
+    p.crashBy = e.id;
+    p.crashT = RULES.codeCrash;
+    this.fx.push({ k: 'crash', id: p.id, x: p.x, y: p.y });
   }
 
   // ---------------------------------------------------------------- shrink
@@ -1343,7 +1605,7 @@ export class Game {
    * closed by the shrink, and not already promised to another drop or a balloon in the air.
    */
   private openTiles(): number[] {
-    const closing = this.shrinkIn() >= 0 && this.shrinkIn() <= RULES.shrinkWarn + sec(1) ? this.shrunk : -1;
+    const closing = this.closingRing();
     const taken = new Set(this.drops.map((d) => d.tile));
     for (const b of this.balloons) if (b.fly) taken.add(tileIndex(tileOf(b.fly.tx), tileOf(b.fly.ty)));
     const out: number[] = [];
@@ -1386,6 +1648,12 @@ export class Game {
   }
 
   // ---------------------------------------------------------------- helpers
+
+  /** The ring the shrink is about to close (within its warning and a second more), or -1. */
+  private closingRing(): number {
+    const left = this.shrinkIn();
+    return left >= 0 && left <= RULES.shrinkWarn + sec(1) ? this.shrunk : -1;
+  }
 
   /** Closest tile (by steps on the grid) to `from` that passes `ok`, or -1. */
   private nearest(from: number, ok: (i: number) => boolean): number {

@@ -1,5 +1,5 @@
 import { COLS, RULES, TICK_RATE, TILE, sec, speedPx } from '../constants';
-import { MOUNT_SPEED, type ItemType } from '../items';
+import type { ItemType } from '../items';
 import type { BotLevel } from '../protocol';
 import { Rng } from '../rng';
 import { DX, DY, OPPOSITE, type Dir } from '../types';
@@ -12,6 +12,7 @@ import {
   inBounds,
   isFloorLike,
   isSolid,
+  moveLevel,
   ringOf,
   tileCenter,
   tileIndex,
@@ -105,6 +106,9 @@ export class Bot {
   private readonly ground = new Uint8Array(TILE_COUNT);
   /** ticks until a balloon in the air lands on the tile (Infinity: none) */
   private readonly landAt = new Float64Array(TILE_COUNT);
+  /** code regions throwing an error, which it walks around unless it is running from a stream */
+  private readonly avoid = new Uint8Array(TILE_COUNT);
+  private avoidOn = false;
   /** tick each balloon was first noticed: reaction time counts from when it appeared, thrown or not */
   private readonly seen = new Map<number, number>();
   private path: number[] = [];
@@ -133,6 +137,10 @@ export class Bot {
     const g = this.game;
     const p = g.byId(this.id);
     if (!p || p.state === DEAD || g.phase !== 'play') {
+      // in deathmatch it comes back somewhere else: start over with a fresh decision then
+      this.path = [];
+      this.placeAt = -1;
+      this.nextThink = g.tick + 1;
       this.send(0, 0);
       return;
     }
@@ -154,7 +162,8 @@ export class Bot {
       this.nextThink = g.tick + 1;
       return;
     }
-    if (g.tick >= this.nextThink) {
+    // an error crashed its screen: like a player who cannot see, it keeps going the way it was going
+    if (g.tick >= this.nextThink && !p.crashT) {
       this.nextThink = g.tick + this.prof.think;
       this.think(p);
     }
@@ -167,15 +176,18 @@ export class Bot {
     const g = this.game;
     this.markGround();
     this.predict(this.base, null);
-    const tpt = this.ticksPerTile(p);
     const here = tileIndex(tileOf(p.x), tileOf(p.y));
     const reg = tileIndex(p.tc, p.tr);
+    // an error underfoot slows it right down: plan with that, or it misjudges how fast it gets away
+    const tpt = this.ticksPerTile(p) * (p.mount !== 'ufo' && g.isError(here) ? 1 / RULES.codeSlow : 1);
+    const m = this.prof.margin;
+    const danger = !this.base.dryFrom(here, 0, m) || !this.base.dryFrom(reg, 0, m);
+    this.avoidOn = !danger; // running from a stream it takes any way out, error or not
     this.search(this.base, p, here, tpt);
     if (p.state === TRAPPED) return this.trapped(p, here);
 
     // 1. streams (or a closing ring) are coming: go to the nearest tile that stays dry
-    const m = this.prof.margin;
-    if (!this.base.dryFrom(here, 0, m) || !this.base.dryFrom(reg, 0, m)) {
+    if (danger) {
       const spot = this.safest(this.base, p, tpt);
       this.placeAt = -1;
       return this.go(spot >= 0 ? spot : this.leastBad(tpt));
@@ -183,12 +195,19 @@ export class Bot {
     // 2. a trapped player within reach: pop an opponent, free a teammate
     const trapped = this.trappedTarget(p, tpt);
     if (trapped >= 0) return this.go(trapped);
-    // 3. an opponent stands in the stream of a balloon dropped right here
-    if (this.canPlace(p) && this.attack(p, tpt)) return;
-    // 4. arrived where it meant to break crates
-    if (this.placeAt >= 0 && this.placeAt === reg && here === reg) {
+    const tank = p.mount === 'tank';
+    if (tank) {
+      // 3'. on a tank the balloon key fires ahead: shoot at opponents, or at crates while farming
       this.placeAt = -1;
-      if (this.canPlace(p) && this.escapeAfter(p, reg, tpt)) return this.drop();
+      if (this.tankShot(p, tpt)) return;
+    } else {
+      // 3. an opponent stands in the stream of a balloon dropped right here
+      if (this.canPlace(p) && this.attack(p, tpt)) return;
+      // 4. arrived where it meant to break crates
+      if (this.placeAt >= 0 && this.placeAt === reg && here === reg) {
+        this.placeAt = -1;
+        if (this.canPlace(p) && this.escapeAfter(p, reg, tpt)) return this.drop();
+      }
     }
     if (this.prof.wander && this.rng.next() < this.prof.wander) return this.go(this.randomSafe(p, tpt));
     // 5. items
@@ -197,6 +216,7 @@ export class Bot {
     // 6. crates, until it is strong enough (or the round late enough) to go after people instead
     const near = this.approach(p, tpt);
     const hunt = near >= 0 && this.level > 0 && (g.tick > TICK_RATE * 60 || g.shrunk > 0 || (p.bal >= 3 && p.pow >= 3));
+    if (tank && !hunt) return this.go(this.randomSafe(p, tpt)); // drive about: new lines to shoot down
     if (!hunt && this.canPlace(p) && g.grid.includes('x')) {
       const spot = this.farmTarget(p, tpt);
       if (spot >= 0) {
@@ -232,10 +252,47 @@ export class Bot {
   private canPlace(p: Player): boolean {
     if (p.dismountT > 0 || p.air) return false;
     const reg = tileIndex(p.tc, p.tr);
-    if (!isFloorLike(this.game.grid[reg]) || this.ground[reg]) return false;
+    if (!isFloorLike(this.game.grid[reg]) || (this.ground[reg] && p.mount !== 'tank')) return false;
     let mine = 0;
     for (const b of this.game.balloons) if (b.owner === p.id) mine++;
-    return mine < p.bal;
+    return mine < this.game.capacity(p);
+  }
+
+  /**
+   * On a tank: fire ahead when the balloon would come to rest where its stream reaches an opponent (or
+   * crates nobody has doomed yet), never a teammate, and there is a dry tile to go to afterwards.
+   */
+  private tankShot(p: Player, tpt: number): boolean {
+    const g = this.game;
+    if (!this.canPlace(p)) return false;
+    const d = p.face || 2;
+    const busy = (i: number) =>
+      !isFloorLike(g.grid[i]) || !!this.ground[i] || g.players.some((q) => q !== p && q.state !== DEAD && tileIndex(q.tc, q.tr) === i);
+    let c = p.tc + DX[d]!;
+    let r = p.tr + DY[d]!;
+    if (!inBounds(c, r) || busy(tileIndex(c, r))) return false;
+    // where it stops: like a kicked balloon, at the last free tile before something in the way
+    for (;;) {
+      const nc = c + DX[d]!;
+      const nr = r + DY[d]!;
+      if (!inBounds(nc, nr) || busy(tileIndex(nc, nr))) break;
+      c = nc;
+      r = nr;
+    }
+    const rest = tileIndex(c, r);
+    const hit = new Set(this.stream(rest, p.pow));
+    const on = (q: Player) => hit.has(tileIndex(q.tc, q.tr));
+    if (g.players.some((q) => q !== p && q.side === p.side && q.state !== DEAD && on(q))) return false;
+    const foes = g.players.some((q) => q.side !== p.side && q.state === ALIVE && q.invulnT === 0 && on(q));
+    let crates = 0;
+    for (const i of hit) if ((g.grid[i] === 'x' || g.grid[i] === 'o') && !this.base.wet[i]!.length) crates++;
+    if (!foes && !crates) return false;
+    if (foes && !crates && this.rng.next() >= this.prof.attack) return false;
+    const here = tileIndex(tileOf(p.x), tileOf(p.y));
+    if (!this.escapeAfter(p, rest, tpt, here)) return false;
+    this.game.pushAction(this.id, 'b');
+    this.path = this.escape;
+    return true;
   }
 
   /** Drops a balloon when an opponent is in its stream and there is a way out afterwards. */
@@ -263,10 +320,13 @@ export class Bot {
     return this.safest(this.alt, q, tpt) >= 0;
   }
 
-  /** Is there a dry tile to run to after dropping a balloon at `tile`? Leaves the route in `escape`. */
-  private escapeAfter(p: Player, tile: number, tpt: number): boolean {
+  /**
+   * Is there a dry tile to run to after a balloon goes down at `tile` (dropped where it stands, or fired
+   * there from `from`)? Leaves the route in `escape`.
+   */
+  private escapeAfter(p: Player, tile: number, tpt: number, from = tile): boolean {
     this.predict(this.alt, { tile, pow: p.pow });
-    this.search(this.alt, p, tile, tpt, tile);
+    this.search(this.alt, p, from, tpt, tile);
     const spot = this.safest(this.alt, p, tpt);
     if (spot < 0 || spot === tile) return false;
     this.escape = this.alt.path(spot);
@@ -342,6 +402,10 @@ export class Bot {
       case 'devil':
       case 'greenDevil':
         return 0;
+      case 'eyepatch':
+        return p.eyepatch ? 0 : p.mount === 'turtle' || p.mount === 'owl' ? 2 : 1;
+      case 'tank':
+        return p.mount ? 0 : 4; // a free hit, and it shoots
       default:
         return p.mount ? 0 : 3; // mounts: one free hit
     }
@@ -454,6 +518,13 @@ export class Bot {
     const g = this.game;
     this.ground.fill(0);
     this.landAt.fill(Infinity);
+    this.avoid.fill(0);
+    if (g.regionCount && g.errors.length) {
+      const p = g.byId(this.id);
+      const mine = p ? (g.regionOf[tileIndex(tileOf(p.x), tileOf(p.y))] ?? -1) : -1;
+      const bad = new Set(g.errors.map((e) => e.region).filter((r) => r !== mine)); // it may always walk out
+      for (let i = 0; i < TILE_COUNT; i++) if (bad.has(g.regionOf[i] ?? -1)) this.avoid[i] = 1;
+    }
     for (const b of g.balloons) {
       if (!this.seen.has(b.id)) this.seen.set(b.id, g.tick);
       if (!b.fly) this.ground[tileIndex(tileOf(b.x), tileOf(b.y))] = 1;
@@ -565,7 +636,7 @@ export class Bot {
 
   private ticksPerTile(p: Player): number {
     if (p.state === TRAPPED) return TILE / (RULES.trappedSpeed / TICK_RATE);
-    return TILE / (speedPx(p.mount ? MOUNT_SPEED[p.mount] : p.spd) / TICK_RATE);
+    return TILE / (speedPx(moveLevel(p)) / TICK_RATE);
   }
 
   private blocked(p: Player, j: number): boolean {
@@ -574,6 +645,7 @@ export class Bot {
     if (isSolid(t) || t === '@') return true; // portals: it would end up somewhere else
     if (p.mount !== 'ufo' && (t === 'x' || t === 'o' || t === '~')) return true;
     if (this.ground[j]) return true;
+    if (this.avoidOn && this.avoid[j] && p.mount !== 'ufo') return true;
     const banana = g.bananas[j];
     if (banana !== null && banana !== undefined && banana !== p.side) return true;
     const it = g.items[j];
@@ -629,7 +701,8 @@ export class Bot {
 
   /** Follows the path with the inputs a player would press: toward the next tile, lining up when blocked. */
   private steer(p: Player): void {
-    const step = speedPx(p.mount ? MOUNT_SPEED[p.mount] : p.spd) / TICK_RATE;
+    const slow = p.mount !== 'ufo' && this.game.isError(tileIndex(tileOf(p.x), tileOf(p.y))) ? RULES.codeSlow : 1;
+    const step = (speedPx(moveLevel(p)) / TICK_RATE) * slow;
     const grid = this.game.grid;
     while (this.path.length) {
       const t = this.path[0]!;

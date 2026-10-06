@@ -302,7 +302,8 @@ export function characterSprite(animal: AnimalKey, color: number, dir: number, f
 
 // ---------------------------------------------------------------- mounts (24 x 16)
 
-export function mountSprite(t: MountType): HTMLCanvasElement {
+/** Mount under the rider (24 x 16); the tank has its own, bigger sprite (tankSprite). */
+export function mountSprite(t: Exclude<MountType, 'tank'>): HTMLCanvasElement {
   return cached(`mount:${t}`, () =>
     sprite(24, 16, (p) => {
       if (t === 'ufo') {
@@ -341,6 +342,48 @@ export function mountSprite(t: MountType): HTMLCanvasElement {
         p.dot(16, 11, '#e53935');
         p.rect(11, 6, 2, 2, WHITE);
       }
+    }),
+  );
+}
+
+// ---------------------------------------------------------------- tank (32 x 18)
+
+const OLIVE = '#6b8e23';
+const OLIVE_DARK = '#4a6318';
+const OLIVE_LIGHT = '#9bbf4a';
+
+/** The tank of 野戰前線, its gun pointing the way the rider faces (1 up, 2 down, 3 left, 4 right). */
+export function tankSprite(face: number): HTMLCanvasElement {
+  const f = face === 1 || face === 3 || face === 4 ? face : 2;
+  return cached(`tank:${f}`, () =>
+    sprite(32, 18, (p) => {
+      // tracks
+      p.rect(3, 11, 26, 7, INK);
+      p.rect(4, 12, 24, 5, '#5b5b5b');
+      for (let x = 6; x < 28; x += 4) p.ovalO(x, 14.5, 1.6, 1.6, '#9e9e9e', INK);
+      // hull
+      p.rect(5, 5, 22, 8, INK);
+      p.rect(6, 6, 20, 6, OLIVE);
+      p.rect(6, 6, 20, 2, OLIVE_LIGHT);
+      p.rect(6, 11, 20, 1, OLIVE_DARK);
+      // gun
+      if (f === 4) {
+        p.rect(20, 5, 12, 4, INK);
+        p.rect(21, 6, 10, 2, OLIVE_DARK);
+      } else if (f === 3) {
+        p.rect(0, 5, 12, 4, INK);
+        p.rect(1, 6, 10, 2, OLIVE_DARK);
+      } else if (f === 2) {
+        p.rect(14, 8, 4, 10, INK);
+        p.rect(15, 9, 2, 8, OLIVE_DARK);
+      } else {
+        p.rect(14, 0, 4, 7, INK);
+        p.rect(15, 1, 2, 5, OLIVE_DARK);
+      }
+      // turret
+      p.ovalO(16, 7, 6, 4, OLIVE, INK);
+      p.oval(15, 6, 3, 1.5, OLIVE_LIGHT);
+      p.dot(21, 9, '#e8d36a');
     }),
   );
 }
@@ -512,6 +555,27 @@ const ITEM_PAINT: Record<ItemType, (p: Px) => void> = {
     p.rect(5, 12, 1, 2, '#90a4ae');
     p.rect(10, 12, 1, 2, '#90a4ae');
     p.rect(2, 14, 12, 1, '#90a4ae');
+  },
+  tank: (p) => {
+    p.rect(1, 10, 14, 5, INK);
+    p.rect(2, 11, 12, 3, '#5b5b5b');
+    for (const x of [3, 6, 9, 12]) p.dot(x, 12, '#bdbdbd');
+    p.rect(2, 6, 12, 5, INK);
+    p.rect(3, 7, 10, 3, OLIVE);
+    p.rect(3, 7, 10, 1, OLIVE_LIGHT);
+    p.rect(9, 4, 7, 3, INK);
+    p.rect(10, 5, 6, 1, OLIVE_DARK);
+    p.ovalO(7, 6, 4, 3, OLIVE, INK);
+    p.dot(6, 5, OLIVE_LIGHT);
+  },
+  eyepatch: (p) => {
+    p.line(1, 4, 15, 4, INK);
+    p.line(1, 5, 15, 5, '#8d6e63');
+    p.ovalO(8, 9, 5, 4.5, '#212121', '#ffca28');
+    p.oval(6.5, 7.5, 1.5, 1, '#616161');
+    p.rect(7, 9, 2, 2, WHITE);
+    p.dot(6, 10, WHITE);
+    p.dot(9, 10, WHITE);
   },
 };
 
