@@ -16,8 +16,8 @@ maintenance.txt，等 hub 顯示維護中再覆蓋檔案，最後刪掉 maintena
 
 一、需求
 --------
-- Windows，已安裝 Node.js 22.18.0
-  （命令提示字元輸入 node -v，應顯示 v22.18.0）
+- Windows，已安裝 Node.js 24
+  （命令提示字元輸入 node -v，應顯示 v24 開頭的版本）
 
 
 二、第一次啟動
@@ -26,7 +26,7 @@ maintenance.txt，等 hub 顯示維護中再覆蓋檔案，最後刪掉 maintena
    這一步是讓其他電腦連得進來（開放 TCP 3000），只要做一次。
 2. 雙擊 start-server.bat。
 3. 視窗出現下列文字就代表啟動成功：
-     水球大亂鬥伺服器已啟動（Node v22.18.0）
+     水球大亂鬥伺服器已啟動（Node v24.22.1）
        同事：http://<這台電腦的 IP>:3000
 4. 把「同事：」那一行的網址給大家，用 Chrome 或 Edge 開啟即可遊玩。
 5. 檢查服務：瀏覽器開 http://<IP>:3000/healthz ，看到 {"ok":true,"version":"0.3.0",...} 就是正常；
@@ -65,7 +65,7 @@ maintenance.txt，等 hub 顯示維護中再覆蓋檔案，最後刪掉 maintena
 六、問題排除
 ------------
 - 先看 logs\launcher.log 與 logs\server.log，裡面會記錄卡在哪一步。
-- 「Node.js was not found」：安裝 Node.js 22.18.0 後，關掉視窗重新執行。
+- 「Node.js was not found」：安裝 Node.js 24 後，關掉視窗重新執行。
 - 「Port 3000 is already in use」：有其他程式占用 3000，改用 start-server.bat 8080。
 - 同事連不上：
   1. 先在伺服器本機開 http://localhost:3000/healthz 確認服務有在跑。

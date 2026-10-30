@@ -4,7 +4,7 @@ rem ==========================================================================
 rem  Water Balloon Brawl - game server launcher for Windows
 rem
 rem  Double-click to start.  Another port:  start-server.bat 8080
-rem  Keep this file next to the "dist" folder.  Needs Node.js 22.18.0.
+rem  Keep this file next to the "dist" folder.  Needs Node.js 24.
 rem  Colleagues open  http://<this PC's IP>:<PORT>  in Chrome or Edge.
 rem  First time only: right-click open-firewall.bat, "Run as administrator".
 rem
@@ -46,7 +46,7 @@ set "NODE_VERSION="
 for /f "delims=" %%v in ('node -v 2^>nul') do set "NODE_VERSION=%%v"
 call :log "node version %NODE_VERSION%"
 echo Node.js %NODE_VERSION%
-if not "%NODE_VERSION%"=="v22.18.0" echo [WARN] This build is tested on Node.js v22.18.0. This PC has %NODE_VERSION%.
+if not "%NODE_VERSION:~0,4%"=="v24." echo [WARN] This build is tested on Node.js 24. This PC has %NODE_VERSION%.
 
 if not exist "dist\server\index.js" goto no_dist
 
@@ -84,7 +84,7 @@ goto done
 
 :no_node
 call :log "error: node not found"
-echo [ERROR] Node.js was not found. Install Node.js 22.18.0 from https://nodejs.org/
+echo [ERROR] Node.js was not found. Install Node.js 24 from https://nodejs.org/
 echo         then close this window and run this file again.
 goto done
 

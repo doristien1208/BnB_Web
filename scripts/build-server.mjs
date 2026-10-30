@@ -1,5 +1,5 @@
 // Bundles the server and its dependencies into one file, so the test machine
-// only needs `dist/` and Node.js 22 — no `npm install` there.
+// only needs `dist/` and Node.js 24 — no `npm install` there.
 import { writeFileSync } from 'node:fs';
 import { build } from 'esbuild';
 
@@ -7,7 +7,7 @@ await build({
   entryPoints: ['server/index.ts'],
   bundle: true,
   platform: 'node',
-  target: 'node22',
+  target: 'node24',
   format: 'esm',
   outfile: 'dist/server/index.js',
   sourcemap: true,

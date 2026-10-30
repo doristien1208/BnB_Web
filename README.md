@@ -12,7 +12,7 @@
 
 ## 環境
 
-Node.js 22.18.0（與測試機相同）。用 nvm 的話，在專案資料夾執行 `nvm use` 會讀 `.nvmrc`。
+Node.js 24（與測試機相同，`.nvmrc` 記著確切版本）。用 nvm 的話，在專案資料夾執行 `nvm use` 會讀 `.nvmrc`。
 
 ```bash
 npm install
@@ -78,7 +78,7 @@ npm run typecheck
 
 不用 hub 時（例如另一台電腦）：第一次先用「以系統管理員身分執行」`BnB\open-firewall.bat`（開放 TCP 3000），再雙擊 `BnB\start-server.bat`；啟動器每一步記在 `BnB\logs\launcher.log`。兩個 bat 刻意只用英文字元：先前的 UTF-8 中文版在測試機上會閃退。
 
-測試機只需要 Node.js 22.18.0，不必 `npm install`。詳細操作、換埠、開機自動啟動與問題排除見 `deploy/README-DEPLOY.txt`（會一起放進套件）。
+測試機只需要 Node.js 24，不必 `npm install`。詳細操作、換埠、開機自動啟動與問題排除見 `deploy/README-DEPLOY.txt`（會一起放進套件）。
 
 ## 調整數值
 
